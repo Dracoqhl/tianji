@@ -9,6 +9,7 @@ from math import isclose
 from pathlib import Path
 
 from companion_t1_features import COMPONENTS
+from companion_power_curve import CURVE_COMPONENTS
 from companion_spatial_features import SPATIAL_COMPONENTS
 from companion_upwind_terrain import COMPONENT as TERRAIN
 from companion_wind_profile import PROFILE_COMPONENTS
@@ -33,8 +34,8 @@ CPU_A_REFERENCE = 85.80038190973126
 STATION_RECIPE_FIELDS = tuple(key for key in RECIPE_FIELDS if key != 'early_stopping_days_inside_train')
 ST_TREE = 'st_tree_halves'
 CANDIDATE_SETS = {'features': COMPONENTS, 'st-tree': (ST_TREE,), 'spatial': SPATIAL_COMPONENTS,
-                  'upwind-terrain': (TERRAIN,), 'wind-profile': PROFILE_COMPONENTS}
-FULL_A_DIAGNOSTICS = (TERRAIN, *PROFILE_COMPONENTS)
+                  'upwind-terrain': (TERRAIN,), 'wind-profile': PROFILE_COMPONENTS, 'power-curve': CURVE_COMPONENTS}
+FULL_A_DIAGNOSTICS = (TERRAIN, *PROFILE_COMPONENTS, *CURVE_COMPONENTS)
 
 
 def fit_options(name):
@@ -334,9 +335,9 @@ def confirm_a(args, settings):
         report['point_48_to_49'] = noon_change_error(truth, {'baseline': baseline, 'candidate': composite})
     if TERRAIN in used:
         report['full_terrain'] = compare_pair(truth, baseline, candidates[TERRAIN], roster, development=True)
-    if any(name in used for name in PROFILE_COMPONENTS):
+    if any(name in used for name in (*PROFILE_COMPONENTS, *CURVE_COMPONENTS)):
         report['full_components'] = {name: compare_pair(truth, baseline, candidates[name], roster, development=True)
-                                     for name in PROFILE_COMPONENTS if name in used}
+                                     for name in (*PROFILE_COMPONENTS, *CURVE_COMPONENTS) if name in used}
     write_json(report_path, report)
     print(f'[A] {args.backend}/{args.device} 基线 {cohort[PRIMARY_SCORE]:.6f}，'
           f'逐站组合 {report["scores"]["candidate"][PRIMARY_SCORE]:.6f}，'
