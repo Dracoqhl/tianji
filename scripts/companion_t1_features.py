@@ -9,6 +9,7 @@ from tempfile import TemporaryDirectory
 import numpy as np
 import pandas as pd
 
+from companion_wind_profile import PROFILE_COMPONENTS, profile_columns
 from independent_t2 import POWER_HOURS, SOURCES, bracket, interpolate
 
 
@@ -170,4 +171,9 @@ def add_components(inputs, feature_names, positions, day_paths, local_cache, com
         diagnostics['local_wind'] = np.maximum(patch_rows[:, 1], patch_rows[:, 5])
         cache_info = {'version': local_cache.version, 'hits': hits, 'days': len(day_paths),
                       'source_fingerprint': hashlib.sha256(json.dumps(fingerprints).encode()).hexdigest()}
+    for mode in PROFILE_COMPONENTS:
+        if mode in components:
+            values, columns_added, diagnostics[mode] = profile_columns(inputs, columns, mode)
+            pieces.append(values)
+            names.extend(columns_added)
     return (inputs if len(pieces) == 1 else np.concatenate(pieces, axis=1)), names, diagnostics, cache_info
