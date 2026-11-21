@@ -16,11 +16,9 @@ TRACKS = {'T1': (12, 96), 'T2': (12, 1), 'T3': (6, 96)}
 
 
 def locate_dataset(requested):
-    candidates = (requested, requested / 'dataset_v2', requested.parent / 'dataset_v2')
-    for candidate in candidates:
-        if all((candidate / name).is_dir() for name in ('train', 'test', 'static', 'submission')):
-            return candidate
-    raise SystemExit('Dataset not found. Pass the directory containing train, test, static and submission.')
+    if not all((requested / name).is_dir() for name in ('train', 'test', 'static', 'submission')):
+        raise SystemExit(f'Dataset root {requested} must contain train, test, static and submission.')
+    return requested
 
 
 def parse_power(value, counts):
@@ -136,7 +134,7 @@ def audit_template(root, track, test_ids):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--data-root', type=Path, default=Path('/workspace/data'))
+    parser.add_argument('--data-root', type=Path, default=Path('/workspace/qhl/data'))
     args = parser.parse_args()
     root = locate_dataset(args.data_root)
     days = sorted(folder for folder in (root / 'train').iterdir() if folder.is_dir())
