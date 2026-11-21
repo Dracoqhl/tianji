@@ -41,7 +41,7 @@ def align_predictions(truth_keys, predictions, keys, value, maximum):
     return pd.Series(numbers, index=index).reindex(expected).to_numpy()
 
 
-def score_track(track, labels, predictions, target_stations):
+def score_track(track, labels, predictions, target_stations, *, allow_unscored_stations=False):
     """Inputs use labeled YYYY-MM-DD dates and the station roster from the track template."""
     stations = set(target_stations)
     if len(stations) != STATION_COUNTS[track] or any(pd.isna(station) or station == '' for station in stations):
@@ -89,9 +89,10 @@ def score_track(track, labels, predictions, target_stations):
         changed_unit_count = int(daily.lt(0).sum())
         clipped_unit = 'station_day'
 
-    unscored_stations = stations.difference(readme.index)
-    if unscored_stations:
+    unscored_stations = sorted(stations.difference(readme.index))
+    if not len(readme) or (unscored_stations and not allow_unscored_stations):
         raise ValueError(f'{len(unscored_stations)} target stations have no eligible validation day; choose a window with coverage for all target stations.')
+    point_counts = count.loc[enough].groupby(level='station_id').size()
     return {
         'track': track,
         'readme_unclipped_score': 100.0 * float(readme.mean()),
@@ -99,7 +100,12 @@ def score_track(track, labels, predictions, target_stations):
         'pdf_clip_unit': clipped_unit,
         'pdf_clip_changed_units': changed_unit_count,
         'validation_station_days': len(truth) // 96,
+        'target_stations': len(stations),
+        'scored_stations': len(readme),
+        'unscored_stations': unscored_stations,
+        'station_aggregation': 'mean_of_scorable_stations' if unscored_stations else 'mean_of_all_target_stations',
         'station_days_at_least_72_valid': days_with_enough_points,
+        'days_at_least_72_per_station': {str(key): int(point_counts.get(key, 0)) for key in sorted(stations)},
         'scored_station_days': int(scored_counts.sum()),
         'scored_days_per_station': {str(key): int(value) for key, value in scored_counts.items()},
     }
@@ -134,11 +140,13 @@ def main():
     parser.add_argument('--template', type=Path, required=True, help='Track submission template, used only for station IDs.')
     parser.add_argument('--start', help='First validation date, inclusive YYYY-MM-DD.')
     parser.add_argument('--end', help='Last validation date, inclusive YYYY-MM-DD.')
+    parser.add_argument('--allow-unscored-stations', action='store_true', help='For local coverage diagnostics, average stations with at least one eligible day.')
     args = parser.parse_args()
     labels = load_labels(args.labels, args.start, args.end)
     predictions = pd.read_csv(args.predictions, dtype={'station_id': str, 'date': str})
     roster = pd.read_csv(args.template, usecols=['station_id'], dtype={'station_id': str})['station_id'].unique()
-    print(json.dumps(score_track(args.track, labels, predictions, roster), indent=2, allow_nan=False))
+    print(json.dumps(score_track(args.track, labels, predictions, roster,
+                                 allow_unscored_stations=args.allow_unscored_stations), indent=2, allow_nan=False))
 
 
 if __name__ == '__main__':
