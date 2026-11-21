@@ -193,7 +193,7 @@ def normalize(train, development):
     return transform(train), transform(development), means, scales
 
 
-def fit_power(train, target, valid, devel, epochs, batch, device_name, progress, *, seed=SEED):
+def fit_power(train, target, valid, devel, epochs, batch, device_name, progress, *, seed=SEED, network_factory=None):
     import torch
     from torch import nn
 
@@ -204,8 +204,12 @@ def fit_power(train, target, valid, devel, epochs, batch, device_name, progress,
     device = torch.device(device_name)
     if device.type == 'cuda':
         torch.cuda.reset_peak_memory_stats(device)
-    network = nn.Sequential(nn.Linear(train.shape[-1], 96), nn.LayerNorm(96), nn.SiLU(),
-                            nn.Linear(96, 96), nn.SiLU(), nn.Linear(96, 1)).to(device)
+    if network_factory is None:
+        network = nn.Sequential(nn.Linear(train.shape[-1], 96), nn.LayerNorm(96), nn.SiLU(),
+                                nn.Linear(96, 96), nn.SiLU(), nn.Linear(96, 1))
+    else:
+        network = network_factory(train.shape[-1])
+    network = network.to(device)
     optimizer = torch.optim.AdamW(network.parameters(), lr=0.0015, weight_decay=0.001)
     keep = valid.any(axis=1)
     if not np.any(keep):
@@ -305,12 +309,13 @@ def power_weather(root, train_days, forecast_days, cache_root, workers, progress
 
 
 def fit_forecasts(root, out, train_days, dev_days, workers, epochs, batch, device, *,
-                  dataset_factory=None, cache_root=None, seed=SEED, forecast_tag='development'):
+                  dataset_factory=None, cache_root=None, seed=SEED, forecast_tag='development', network_factory=None,
+                  weather_loader=power_weather):
     start = monotonic()
     def progress(message):
         print(f'[{monotonic() - start:.1f}s] {message}', flush=True)
 
-    roster, (weather, columns, cache_hits, cache_version) = power_weather(
+    roster, (weather, columns, cache_hits, cache_version) = weather_loader(
         root, train_days, dev_days, cache_root or out / 'features', workers, progress, dataset_factory,
     )
     weather_seconds = monotonic() - start
@@ -326,7 +331,8 @@ def fit_forecasts(root, out, train_days, dev_days, workers, epochs, batch, devic
 
     train_start = monotonic()
     network, predict, trajectory, device_label, peak = fit_power(
-        train, actual, valid_mask, development, epochs, batch, device, progress, seed=seed,
+        train, actual, valid_mask, development, epochs, batch, device, progress,
+        seed=seed, network_factory=network_factory,
     )
     train_seconds = monotonic() - train_start
 
