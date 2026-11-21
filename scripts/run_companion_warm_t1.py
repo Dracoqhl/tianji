@@ -17,6 +17,7 @@ import pandas as pd
 from companion_spatial_features import SPATIAL_COMPONENTS, StationNeighborCache, extend_spatial
 from companion_t1_features import COMPONENTS, LocalWindCache, add_components, station_day_weights
 from companion_upwind_terrain import COMPONENT as TERRAIN, UpwindTerrain
+from companion_wind_profile import PROFILE_COMPONENTS, training_shear_thresholds
 from score_forecasts import CAPACITY_MW, MAX_PREDICTION, score_track
 from tree_model import best_iteration, check_backend, fitted_device, lightgbm_progress, predict_tree
 from tree_model import save_tree_model, train_tree, xgboost_parameters
@@ -86,7 +87,7 @@ SMOKE_TRAIN_DAYS = 20
 SMOKE_VALIDATION_DAYS = 10
 SMOKE_MAX_ROUNDS = 20
 FORECAST_PARTITIONS = {'full': ((1, 96),), 'halves': ((1, 48), (49, 96))}
-SUPPORTED_COMPONENTS = (*COMPONENTS, *SPATIAL_COMPONENTS, TERRAIN)
+SUPPORTED_COMPONENTS = (*COMPONENTS, *SPATIAL_COMPONENTS, TERRAIN, *PROFILE_COMPONENTS)
 
 
 def sha256(path):
@@ -325,7 +326,7 @@ def run(args):
     del metadata, day_idx
     inputs = np.ascontiguousarray(weather[valid], dtype=np.float32)
     del weather
-    inputs, refit_names, _, training_local = add_components(
+    inputs, refit_names, training_diagnostic, training_local = add_components(
         inputs, original_names, positions, train_paths, local_cache, args.components,
     )
     inputs, refit_names, training_spatial = extend_spatial(
@@ -337,6 +338,9 @@ def run(args):
             raise ValueError('The upwind terrain lookup changed during feature extraction.')
     if refit_names != feature_names:
         raise ValueError('Prediction and training feature schemas disagree.')
+    shear_thresholds = (training_shear_thresholds(training_diagnostic[args.diagnostic])
+                        if args.diagnostic in PROFILE_COMPONENTS else None)
+    del training_diagnostic
     valid_sample_hash = hashlib.sha256(positions.tobytes() + target.tobytes()).hexdigest()
     assemble_seconds = monotonic() - start
 
@@ -415,6 +419,8 @@ def run(args):
         path = args.out / 'diagnostic.npy'
         np.save(path, diagnostic[args.diagnostic], allow_pickle=False)
         diagnostic_info = {'component': args.diagnostic, 'sha256': sha256(path), 'file': path.name}
+        if shear_thresholds is not None:
+            diagnostic_info['training_abs_shear_p90'] = shear_thresholds
 
     result = {
         'phase': args.phase, 'seed': args.seed, 'components': args.components, 'smoke': args.smoke,
@@ -473,7 +479,7 @@ def main():
     parser.add_argument('--phase', choices=('A', 'B'), default='A')
     parser.add_argument('--seed', type=int)
     parser.add_argument('--components', choices=SUPPORTED_COMPONENTS, nargs='*', default=[])
-    parser.add_argument('--diagnostic', choices=(*COMPONENTS, TERRAIN))
+    parser.add_argument('--diagnostic', choices=(*COMPONENTS, TERRAIN, *PROFILE_COMPONENTS))
     parser.add_argument('--terrain-lookup', type=Path)
     parser.add_argument('--local-wind-cache', type=Path, default=Path('/workspace/qhl/runs/companion_t1_local_wind'))
     parser.add_argument('--early-stop-days', type=int)
@@ -510,6 +516,8 @@ def main():
     if len(args.components) != len(set(args.components)):
         parser.error('--components cannot contain duplicates.')
     args.components = [component for component in SUPPORTED_COMPONENTS if component in args.components]
+    if sum(name in args.components for name in PROFILE_COMPONENTS) > 1:
+        parser.error('Select exactly one wind-profile alternative per fit.')
     if TERRAIN in args.components and args.terrain_lookup is None:
         parser.error('The upwind_terrain component requires --terrain-lookup.')
     if not args.smoke and args.seed not in ((A_SEED,) if args.phase == 'A' else B_SEEDS):
