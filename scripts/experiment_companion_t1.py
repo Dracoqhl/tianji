@@ -14,6 +14,7 @@ import numpy as np
 import pandas as pd
 
 from companion_t1_features import COMPONENTS
+from companion_upwind_terrain import COMPONENT as TERRAIN
 from compare_warm_t1 import MINIMUM_GAIN, PRIMARY_SCORE, b_statistics, compare_pair, diagnostic_errors
 from run_companion_warm_t1 import A_SEED, B_SEEDS, DEFAULT_THREADS, EARLY_STOP_DAYS, GPU_THREADS, SPLIT_PATH
 from run_companion_warm_t1 import cache_paths, cache_version, date_roles, forecast_keys, sha256, write_json
@@ -51,7 +52,7 @@ def event(out, stage, **fields):
 def code_version():
     files = ('experiment_companion_t1.py', RUNNER.name, 'companion_t1_features.py', 'compare_warm_t1.py',
              'warm_shared_power.py', 'independent_t2.py', 'score_forecasts.py', 'tree_model.py',
-             'companion_spatial_features.py')
+             'companion_spatial_features.py', 'companion_upwind_terrain.py')
     return {name: sha256(SCRIPT_DIR / name) for name in files}
 
 
@@ -123,6 +124,8 @@ def fit_or_reuse(args, directory, keys, phase, seed, components, versions, diagn
             command.extend(('--config', str(args.config)))
         if diagnostic:
             command.extend(('--diagnostic', diagnostic))
+        if TERRAIN in components:
+            command.extend(('--terrain-lookup', str(args.terrain_lookup)))
         command.extend(('--components', *components))
         event(args.out, phase, status='fit_started', run=str(directory.relative_to(args.out)),
               seed=seed, components=components, point_partition=point_partition,
@@ -147,6 +150,8 @@ def fit_or_reuse(args, directory, keys, phase, seed, components, versions, diagn
                                          point_partition=point_partition)
     if receipt['companion_cache_metadata_sha256'] != versions:
         raise ValueError(f'{directory}: companion cache files changed during or after this run.')
+    if TERRAIN in components and receipt[TERRAIN]['lookup_sha256'] != sha256(args.terrain_lookup):
+        raise ValueError(f'{directory}: upwind terrain lookup differs from the fit receipt.')
     return receipt, forecast, digest
 
 
