@@ -50,7 +50,8 @@ def event(out, stage, **fields):
 
 def code_version():
     files = ('experiment_companion_t1.py', RUNNER.name, 'companion_t1_features.py', 'compare_warm_t1.py',
-             'warm_shared_power.py', 'independent_t2.py', 'score_forecasts.py', 'tree_model.py')
+             'warm_shared_power.py', 'independent_t2.py', 'score_forecasts.py', 'tree_model.py',
+             'companion_spatial_features.py')
     return {name: sha256(SCRIPT_DIR / name) for name in files}
 
 
