@@ -83,6 +83,7 @@ SMOKE_SEED = 42
 SMOKE_TRAIN_DAYS = 20
 SMOKE_VALIDATION_DAYS = 10
 SMOKE_MAX_ROUNDS = 20
+FORECAST_PARTITIONS = {'full': ((1, 96),), 'halves': ((1, 48), (49, 96))}
 
 
 def sha256(path):
@@ -231,6 +232,11 @@ def forecast_keys(days, roster):
                                       names=['date', 'station_id', 'point_index']).to_frame(index=False)
 
 
+def point_mask(positions, first, last):
+    points = positions % 96 + 1
+    return (points >= first) & (points <= last)
+
+
 def run(args):
     sys.path.insert(0, str(args.companion_code / 'src'))
     backend_version = check_backend(args.backend, args.device)
@@ -307,10 +313,6 @@ def run(args):
     if refit_names != feature_names:
         raise ValueError('Prediction and training feature schemas disagree.')
     valid_sample_hash = hashlib.sha256(positions.tobytes() + target.tobytes()).hexdigest()
-    selection_weight = refit_weight = None
-    if 'station_day_weight' in args.components:
-        selection_weight = station_day_weights(positions[~inner], len(stations))
-        refit_weight = station_day_weights(positions, len(stations))
     assemble_seconds = monotonic() - start
 
     def fit(X, y, config, weights, **validation):
@@ -326,30 +328,58 @@ def run(args):
         )
         return model, dict(xgboost_parameters(config, args.device), effective_device=fitted_device(model.booster))
 
-    fit_start = monotonic()
-    print(f'Selecting iterations inside the {len(train_days)} training dates, seed {args.seed}, '
-          f'{args.backend}/{args.device}, up to {params["n_estimators"]} trees', flush=True)
-    selection, selection_params = fit(inputs[~inner], target[~inner], params, selection_weight,
-                                      X_valid=inputs[inner], y_valid=target[inner])
-    best = best_iteration(selection, backend=args.backend, fallback=params['n_estimators'])
-    if best < 1:
-        raise ValueError('The companion trainer returned an invalid iteration budget.')
-    del selection
-    print(f'Refitting all {len(train_days)} training dates with {best} trees', flush=True)
-    fitted, refit_params = fit(inputs, target, dict(params, n_estimators=best), refit_weight)
-    fit_seconds = monotonic() - fit_start
     save = save_model if args.backend == 'lightgbm' else save_tree_model
-    save(fitted, args.out / 'companion_T1.joblib')
+    prediction = np.full(len(keys), np.nan, dtype=float)
+    fit_seconds = prediction_seconds = 0.0
+    expert_receipts = []
+    full = args.point_partition == 'full'
+    for first, last in FORECAST_PARTITIONS[args.point_partition]:
+        training_mask = point_mask(positions, first, last)
+        fit_mask = training_mask & ~inner
+        early_stop_mask = training_mask & inner
+        if not fit_mask.any() or not early_stop_mask.any():
+            raise ValueError(f'Points {first}–{last} require usable fit and early-stop rows.')
+        train_selection = slice(None) if full else training_mask
+        prediction_selection = slice(None) if full else point_mask(prediction_positions, first, last)
+        selection_weight = refit_weight = None
+        if 'station_day_weight' in args.components:
+            selection_weight = station_day_weights(positions[fit_mask], len(stations))
+            refit_weight = station_day_weights(positions[train_selection], len(stations))
+        fit_start = monotonic()
+        print(f'Selecting iterations for points {first}–{last} inside {len(train_days)} training dates, '
+              f'seed {args.seed}, {args.backend}/{args.device}, up to {params["n_estimators"]} trees', flush=True)
+        selection, selection_params = fit(inputs[fit_mask], target[fit_mask], params, selection_weight,
+                                          X_valid=inputs[early_stop_mask], y_valid=target[early_stop_mask])
+        best = best_iteration(selection, backend=args.backend, fallback=params['n_estimators'])
+        if best < 1:
+            raise ValueError('The companion trainer returned an invalid iteration budget.')
+        del selection
+        print(f'Refitting points {first}–{last} on all {len(train_days)} training dates with {best} trees', flush=True)
+        fitted, refit_params = fit(inputs[train_selection], target[train_selection],
+                                   dict(params, n_estimators=best), refit_weight)
+        fit_seconds += monotonic() - fit_start
+        model_name = 'companion_T1.joblib' if full else f'companion_T1_points_{first:02d}_{last:02d}.joblib'
+        save(fitted, args.out / model_name)
+
+        predict_start = monotonic()
+        location = 'training-block holdout' if args.train_block else f'phase {args.phase}'
+        print(f'Predicting points {first}–{last} for the {len(forecast_days)} {location} dates', flush=True)
+        X = predict_inputs[prediction_selection]
+        values = (predict(fitted, X) if args.backend == 'lightgbm'
+                  else predict_tree(fitted, X, backend=args.backend))
+        prediction[prediction_selection] = np.asarray(values, dtype=float).reshape(-1) * CAPACITY_MW
+        prediction_seconds += monotonic() - predict_start
+        expert_receipts.append({
+            'point_range': [first, last], 'model_file': model_name, 'trees': best,
+            'train_rows': int(training_mask.sum()), 'early_stop_rows': int(early_stop_mask.sum()),
+            'fit_parameters': {'selection': selection_params, 'refit': refit_params},
+        })
+        del fitted, X
     del inputs
 
     prediction_start = monotonic()
-    location = 'training-block holdout' if args.train_block else f'phase {args.phase}'
-    print(f'Predicting the {len(forecast_days)} {location} dates', flush=True)
-    values = (predict(fitted, predict_inputs) if args.backend == 'lightgbm'
-              else predict_tree(fitted, predict_inputs, backend=args.backend))
-    prediction = np.asarray(values, dtype=float).reshape(-1) * CAPACITY_MW
-    if not np.isfinite(prediction).all() or len(prediction) != len(keys):
-        raise ValueError('Invalid forecast length or non-finite prediction.')
+    if not np.isfinite(prediction).all():
+        raise ValueError('Missing or non-finite forecast values.')
     keys['prediction'] = np.clip(prediction, 0, MAX_PREDICTION['T1'])
     forecast_csv = args.out / f'companion_T1_{"development" if args.phase == "A" else "sealed"}.csv'
     pending = forecast_csv.with_suffix('.tmp')
@@ -363,6 +393,7 @@ def run(args):
 
     result = {
         'phase': args.phase, 'seed': args.seed, 'components': args.components, 'smoke': args.smoke,
+        'point_partition': args.point_partition, 'experts': expert_receipts,
         'train_block': [day.isoformat() for day in args.train_block] if args.train_block else None,
         'backend': args.backend, 'device': args.device, 'backend_version': backend_version,
         'data_root': str(args.data_root.resolve()), 'feature_workdir': str(args.workdir.resolve()),
@@ -376,18 +407,22 @@ def run(args):
         'train_valid_rows': len(target), 'valid_training_sample_sha256': valid_sample_hash,
         'feature_keys': {'training': train_key_stats, 'training_sample': sample_stats,
                          'prediction': {'rows': len(keys), 'duplicate_rows': 0, 'missing_grid_keys': 0}},
-        'early_stopping_valid_rows': int(inner.sum()), 'best_iteration': best, 'final_n_estimators': best,
-        'fit_parameters': {'selection': selection_params, 'refit': refit_params},
+        'early_stopping_valid_rows': int(inner.sum()),
         'feature_count': len(feature_names), 'feature_names': feature_names,
         'prediction_file': forecast_csv.name, 'prediction_rows': len(keys),
         'clipped_predictions': int(((prediction < 0) | (prediction > MAX_PREDICTION['T1'])).sum()),
         'prediction_sha256': sha256(forecast_csv), 'diagnostic': diagnostic_info,
         'phase_seconds': {'assembly': assemble_seconds, 'fit': fit_seconds,
-                          'prediction_and_export': monotonic() - prediction_start},
+                          'prediction_and_export': prediction_seconds + monotonic() - prediction_start},
     }
+    if full:
+        expert = expert_receipts[0]
+        result.update(best_iteration=expert['trees'], final_n_estimators=expert['trees'],
+                      fit_parameters=expert['fit_parameters'])
     if args.backend == 'lightgbm':
         result['lightgbm_version'] = backend_version
-        result['lightgbm_fit_parameters'] = result['fit_parameters']
+        if full:
+            result['lightgbm_fit_parameters'] = result['fit_parameters']
     if versions != {'training': cache_version(train_paths), 'prediction': cache_version(prediction_paths)}:
         raise ValueError('Companion cache files changed while training or predicting.')
     write_json(args.out / 'training_receipt.json', result)
@@ -416,6 +451,7 @@ def main():
     parser.add_argument('--threads', type=int)
     parser.add_argument('--backend', choices=('lightgbm', 'xgboost'), default='lightgbm')
     parser.add_argument('--device', choices=('cpu', 'cuda'), default='cpu')
+    parser.add_argument('--point-partition', choices=FORECAST_PARTITIONS, default='full')
     parser.add_argument('--smoke', action='store_true', help='Run 20 training days, 10 A days and at most 20 trees.')
     parser.add_argument('--train-block', type=date.fromisoformat, nargs=2, metavar=('FIRST', 'LAST'),
                         help='Predict an all-training-role block, fitting only on earlier training dates.')
