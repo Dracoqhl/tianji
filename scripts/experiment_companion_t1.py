@@ -14,6 +14,7 @@ import numpy as np
 import pandas as pd
 
 from companion_t1_features import COMPONENTS
+from companion_power_curve import CURVE_COMPONENTS
 from companion_upwind_terrain import COMPONENT as TERRAIN
 from compare_warm_t1 import MINIMUM_GAIN, PRIMARY_SCORE, b_statistics, compare_pair, diagnostic_errors
 from run_companion_warm_t1 import A_SEED, B_SEEDS, DEFAULT_THREADS, EARLY_STOP_DAYS, GPU_THREADS, SPLIT_PATH
@@ -52,7 +53,8 @@ def event(out, stage, **fields):
 def code_version():
     files = ('experiment_companion_t1.py', RUNNER.name, 'companion_t1_features.py', 'compare_warm_t1.py',
              'warm_shared_power.py', 'independent_t2.py', 'score_forecasts.py', 'tree_model.py',
-             'companion_spatial_features.py', 'companion_upwind_terrain.py', 'companion_wind_profile.py')
+             'companion_spatial_features.py', 'companion_upwind_terrain.py', 'companion_wind_profile.py',
+             'companion_power_curve.py')
     return {name: sha256(SCRIPT_DIR / name) for name in files}
 
 
@@ -85,6 +87,10 @@ def load_run(directory, expected_keys, phase, seed, components, *, backend, devi
     path = directory / receipt['prediction_file']
     if sha256(path) != receipt['prediction_sha256']:
         raise ValueError(f'{path}: forecast hash mismatch.')
+    if any(component in CURVE_COMPONENTS for component in components):
+        curve = receipt['power_curve']
+        if curve['file'] != 'power_curve_prior.json' or sha256(directory / curve['file']) != curve['sha256']:
+            raise ValueError(f'{directory}: power-curve prior hash mismatch.')
     original = pd.read_csv(path, dtype={'station_id': str, 'date': str}, float_precision='round_trip')
     forecast = expected_keys.assign(prediction=align_predictions(
         expected_keys, original, POINT_KEYS, 'prediction', MAX_PREDICTION['T1'],
