@@ -79,8 +79,8 @@ def keys_for(days, roster, track):
 def read_frozen_forecast(path, digest, keys, track):
     if sha256(path) != digest:
         raise ValueError(f'{path}: B forecast hash mismatch.')
-    value = 'prediction' if track == 'T1' else 'energy'
-    fields = POINT_KEYS if track == 'T1' else DAY_KEYS
+    value = 'energy' if track == 'T2' else 'prediction'
+    fields = DAY_KEYS if track == 'T2' else POINT_KEYS
     frame = pd.read_csv(path, dtype={'station_id': str, 'date': str}, float_precision='round_trip')
     return keys.assign(**{value: align_predictions(keys, frame, fields, value, MAX_PREDICTION[track])})
 
