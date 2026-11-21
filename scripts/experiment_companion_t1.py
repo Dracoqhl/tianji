@@ -66,13 +66,14 @@ def setup(args):
     }
 
 
-def load_run(directory, expected_keys, phase, seed, components, *, backend, device, block_scope=None):
+def load_run(directory, expected_keys, phase, seed, components, *, backend, device, block_scope=None,
+             point_partition='full'):
     receipt_path = directory / 'training_receipt.json'
     receipt = read_json(receipt_path)
     expected_file = 'companion_T1_development.csv' if phase == 'A' else 'companion_T1_sealed.csv'
     expected = {'phase': phase, 'seed': seed, 'components': components, 'split_sha256': FROZEN_SPLIT,
                 'backend': backend, 'device': device, 'smoke': False,
-                'train_block': None,
+                'train_block': None, 'point_partition': point_partition,
                 'train_days': 586 if phase == 'A' else 628, 'forecast_days': 42 if phase == 'A' else 92,
                 'prediction_file': expected_file, 'prediction_rows': len(expected_keys)}
     if block_scope:
@@ -95,7 +96,8 @@ def assert_matched(first, second, fields=MATCH_FIELDS):
         raise ValueError(f'The compared training receipts differ in matched inputs: {differences}.')
 
 
-def fit_or_reuse(args, directory, keys, phase, seed, components, versions, diagnostic=None, *, train_block=None):
+def fit_or_reuse(args, directory, keys, phase, seed, components, versions, diagnostic=None, *, train_block=None,
+                 point_partition='full'):
     block_scope = None
     early_stop_days = EARLY_STOP_DAYS
     if train_block is not None:
@@ -112,6 +114,7 @@ def fit_or_reuse(args, directory, keys, phase, seed, components, versions, diagn
                    '--data-root', str(args.data_root), '--out', str(staging), '--split', str(args.split),
                    '--local-wind-cache', str(args.local_wind_cache), '--threads', str(args.threads),
                    '--backend', args.backend, '--device', args.device,
+                   '--point-partition', point_partition,
                    '--early-stop-days', str(early_stop_days)]
         if block_scope:
             command.extend(('--train-block', *block_scope['train_block']))
@@ -121,7 +124,8 @@ def fit_or_reuse(args, directory, keys, phase, seed, components, versions, diagn
             command.extend(('--diagnostic', diagnostic))
         command.extend(('--components', *components))
         event(args.out, phase, status='fit_started', run=str(directory.relative_to(args.out)),
-              seed=seed, components=components, log=str(staging.relative_to(args.out) / 'train.log'))
+              seed=seed, components=components, point_partition=point_partition,
+              log=str(staging.relative_to(args.out) / 'train.log'))
         with (staging / 'train.log').open('w') as log, subprocess.Popen(
             command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
         ) as process:
@@ -133,12 +137,13 @@ def fit_or_reuse(args, directory, keys, phase, seed, components, versions, diagn
                 raise RuntimeError(f'T1 training failed for {directory.name}. See {staging / "train.log"}.')
         # Only publish a directory that contains a verified receipt and complete forecasts.
         load_run(staging, keys, phase, seed, components, backend=args.backend, device=args.device,
-                 block_scope=block_scope)
+                 block_scope=block_scope, point_partition=point_partition)
         staging.rename(directory)
         event(args.out, phase, status='fit_complete', run=str(directory.relative_to(args.out)), seed=seed,
               log=str(directory.relative_to(args.out) / 'train.log'))
     receipt, forecast, digest = load_run(directory, keys, phase, seed, components,
-                                         backend=args.backend, device=args.device, block_scope=block_scope)
+                                         backend=args.backend, device=args.device, block_scope=block_scope,
+                                         point_partition=point_partition)
     if receipt['companion_cache_metadata_sha256'] != versions:
         raise ValueError(f'{directory}: companion cache files changed during or after this run.')
     return receipt, forecast, digest
