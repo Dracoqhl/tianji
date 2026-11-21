@@ -108,6 +108,19 @@ def date_roles(path, phase):
     return sorted(split['train'] + split['development']), sealed
 
 
+def training_block_dates(path, first, last):
+    train, _ = date_roles(path, 'A')
+    prior = [day for day in train if day < first]
+    held_out = [day for day in train if first <= day <= last]
+    if not prior or not held_out or len(held_out) != (last - first).days + 1:
+        raise ValueError('A training block must be wholly within the training role and have earlier training days.')
+    return prior, held_out
+
+
+def block_early_stop_days(train_days):
+    return min(EARLY_STOP_DAYS, max(7, len(train_days) // 5))
+
+
 def cache_version(paths):
     files = [(path.name, path.stat()) for path in paths]
     return hashlib.sha256(json.dumps([(name, info.st_size, info.st_mtime_ns)
@@ -227,7 +240,10 @@ def run(args):
     if args.backend == 'lightgbm':
         from tianji.models.gbdt import predict, save_model, train_lgbm
 
-    train_days, forecast_days = date_roles(args.split, args.phase)
+    if args.train_block:
+        train_days, forecast_days = training_block_dates(args.split, *args.train_block)
+    else:
+        train_days, forecast_days = date_roles(args.split, args.phase)
     if args.smoke:
         train_days = train_days[:SMOKE_TRAIN_DAYS]
         forecast_days = forecast_days[:SMOKE_VALIDATION_DAYS]
@@ -327,7 +343,8 @@ def run(args):
     del inputs
 
     prediction_start = monotonic()
-    print(f'Predicting the {len(forecast_days)} phase {args.phase} dates', flush=True)
+    location = 'training-block holdout' if args.train_block else f'phase {args.phase}'
+    print(f'Predicting the {len(forecast_days)} {location} dates', flush=True)
     values = (predict(fitted, predict_inputs) if args.backend == 'lightgbm'
               else predict_tree(fitted, predict_inputs, backend=args.backend))
     prediction = np.asarray(values, dtype=float).reshape(-1) * CAPACITY_MW
@@ -346,6 +363,7 @@ def run(args):
 
     result = {
         'phase': args.phase, 'seed': args.seed, 'components': args.components, 'smoke': args.smoke,
+        'train_block': [day.isoformat() for day in args.train_block] if args.train_block else None,
         'backend': args.backend, 'device': args.device, 'backend_version': backend_version,
         'data_root': str(args.data_root.resolve()), 'feature_workdir': str(args.workdir.resolve()),
         'feature_spec_sha256': sha256(spec_path), 'companion_cache_metadata_sha256': versions,
@@ -399,16 +417,24 @@ def main():
     parser.add_argument('--backend', choices=('lightgbm', 'xgboost'), default='lightgbm')
     parser.add_argument('--device', choices=('cpu', 'cuda'), default='cpu')
     parser.add_argument('--smoke', action='store_true', help='Run 20 training days, 10 A days and at most 20 trees.')
+    parser.add_argument('--train-block', type=date.fromisoformat, nargs=2, metavar=('FIRST', 'LAST'),
+                        help='Predict an all-training-role block, fitting only on earlier training dates.')
     parser.add_argument('--check-only', action='store_true', help='Check the full prediction grid and sampled training keys.')
     args = parser.parse_args()
     if args.smoke and (args.phase != 'A' or args.out is None):
         parser.error('Use --phase A and an explicit --out for --smoke.')
+    if args.train_block and (args.phase != 'A' or args.smoke or args.out is None):
+        parser.error('Use --phase A and an explicit --out for --train-block.')
     if args.threads is None:
         args.threads = GPU_THREADS if args.device == 'cuda' else DEFAULT_THREADS
     if args.seed is None:
         args.seed = SMOKE_SEED if args.smoke else A_SEED
     if args.early_stop_days is None:
-        args.early_stop_days = 4 if args.smoke else EARLY_STOP_DAYS
+        if args.train_block:
+            train, _ = training_block_dates(args.split, *args.train_block)
+            args.early_stop_days = block_early_stop_days(train)
+        else:
+            args.early_stop_days = 4 if args.smoke else EARLY_STOP_DAYS
     if args.out is None:
         suffix = 'v1' if args.backend == 'lightgbm' else f'{args.backend}_{args.device}'
         args.out = Path(f'/workspace/qhl/runs/companion_warm_t1_{suffix}')
