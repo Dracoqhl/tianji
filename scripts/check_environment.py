@@ -164,7 +164,7 @@ def free_gib(path):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--data-root', type=Path, default=Path('/workspace/data'))
+    parser.add_argument('--data-root', type=Path, default=Path('/workspace/qhl/data'))
     parser.add_argument('--scratch-dir', type=Path, default=Path.cwd(),
                         help='Existing location for future experiment artifacts; checks free space.')
     parser.add_argument('--skip-netcdf', action='store_true')
