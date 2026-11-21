@@ -11,6 +11,7 @@ from pathlib import Path
 from companion_t1_features import COMPONENTS
 from companion_spatial_features import SPATIAL_COMPONENTS
 from companion_upwind_terrain import COMPONENT as TERRAIN
+from companion_wind_profile import PROFILE_COMPONENTS
 from compare_warm_t1 import MINIMUM_GAIN, PRIMARY_SCORE, compare_pair, daily_scores
 from experiment_companion_t1 import RECIPE_FIELDS, assert_matched, event, fit_or_reuse, load_run, phase_versions
 from experiment_companion_t1 import read_json, setup
@@ -31,7 +32,9 @@ A_REPORT = 'a_station_routes.json'
 CPU_A_REFERENCE = 85.80038190973126
 STATION_RECIPE_FIELDS = tuple(key for key in RECIPE_FIELDS if key != 'early_stopping_days_inside_train')
 ST_TREE = 'st_tree_halves'
-CANDIDATE_SETS = {'features': COMPONENTS, 'st-tree': (ST_TREE,), 'spatial': SPATIAL_COMPONENTS, 'upwind-terrain': (TERRAIN,)}
+CANDIDATE_SETS = {'features': COMPONENTS, 'st-tree': (ST_TREE,), 'spatial': SPATIAL_COMPONENTS,
+                  'upwind-terrain': (TERRAIN,), 'wind-profile': PROFILE_COMPONENTS}
+FULL_A_DIAGNOSTICS = (TERRAIN, *PROFILE_COMPONENTS)
 
 
 def fit_options(name):
@@ -295,7 +298,7 @@ def confirm_a(args, settings):
     keys = forecast_keys(held_out, roster)
     versions = phase_versions(args, train, held_out)
     directory = args.out / 'a'
-    used = [name for name in settings['candidates'] if name == TERRAIN or name in routes.values()]
+    used = [name for name in settings['candidates'] if name in FULL_A_DIAGNOSTICS or name in routes.values()]
     total = 2 + len(used)
     show_progress(args.out, 'A 集复核', 0, total, '开始')
     print('[A] Fit the matched GPU baseline', flush=True)
@@ -305,10 +308,11 @@ def confirm_a(args, settings):
     receipts, candidates = {'baseline': baseline_receipt}, {}
     show_progress(args.out, 'A 集复核', 1, total, '基线预测已保存')
     for index, name in enumerate(used, 2):
-        print(f'[A] Refit for frozen station route {name}', flush=True)
+        print(f'[A] Refit registered alternative {name}', flush=True)
         components, partition = fit_options(name)
         receipt, forecast, _ = fit_or_reuse(args, directory / name, keys, 'A', A_SEED, components, versions,
-                                            diagnostic=TERRAIN if name == TERRAIN else None, point_partition=partition)
+                                            diagnostic=name if name in FULL_A_DIAGNOSTICS else None,
+                                            point_partition=partition)
         assert_matched(baseline_receipt, receipt)
         receipts[name], candidates[name] = receipt, forecast
         show_progress(args.out, 'A 集复核', index, total, f'{name} 预测已保存')
@@ -330,6 +334,9 @@ def confirm_a(args, settings):
         report['point_48_to_49'] = noon_change_error(truth, {'baseline': baseline, 'candidate': composite})
     if TERRAIN in used:
         report['full_terrain'] = compare_pair(truth, baseline, candidates[TERRAIN], roster, development=True)
+    if any(name in used for name in PROFILE_COMPONENTS):
+        report['full_components'] = {name: compare_pair(truth, baseline, candidates[name], roster, development=True)
+                                     for name in PROFILE_COMPONENTS if name in used}
     write_json(report_path, report)
     print(f'[A] {args.backend}/{args.device} 基线 {cohort[PRIMARY_SCORE]:.6f}，'
           f'逐站组合 {report["scores"]["candidate"][PRIMARY_SCORE]:.6f}，'
