@@ -16,6 +16,7 @@ import pandas as pd
 
 from companion_spatial_features import SPATIAL_COMPONENTS, StationNeighborCache, extend_spatial
 from companion_t1_features import COMPONENTS, LocalWindCache, add_components, station_day_weights
+from companion_upwind_terrain import COMPONENT as TERRAIN, UpwindTerrain
 from score_forecasts import CAPACITY_MW, MAX_PREDICTION, score_track
 from tree_model import best_iteration, check_backend, fitted_device, lightgbm_progress, predict_tree
 from tree_model import save_tree_model, train_tree, xgboost_parameters
@@ -85,7 +86,7 @@ SMOKE_TRAIN_DAYS = 20
 SMOKE_VALIDATION_DAYS = 10
 SMOKE_MAX_ROUNDS = 20
 FORECAST_PARTITIONS = {'full': ((1, 96),), 'halves': ((1, 48), (49, 96))}
-SUPPORTED_COMPONENTS = (*COMPONENTS, *SPATIAL_COMPONENTS)
+SUPPORTED_COMPONENTS = (*COMPONENTS, *SPATIAL_COMPONENTS, TERRAIN)
 
 
 def sha256(path):
@@ -302,6 +303,15 @@ def run(args):
     predict_inputs, feature_names, prediction_spatial = extend_spatial(
         predict_inputs, feature_names, prediction_positions, prediction_paths, spatial_cache, args.components,
     )
+    terrain = None
+    if TERRAIN in args.components:
+        lookup_digest = sha256(args.terrain_lookup)
+        terrain = UpwindTerrain(args.terrain_lookup, roster)
+        predict_inputs, feature_names, terrain_prediction, bearing = terrain.append(
+            predict_inputs, feature_names, prediction_positions, with_bearing=args.diagnostic == TERRAIN,
+        )
+        if bearing is not None:
+            diagnostic[TERRAIN] = bearing
 
     print(f'Reading training features for {len(train_paths)} selected dates', flush=True)
     weather, _, metadata = build_gbdt_rows(train_paths, stations, CAPACITY_MW, include_invalid=True, verbose=True)
@@ -321,6 +331,10 @@ def run(args):
     inputs, refit_names, training_spatial = extend_spatial(
         inputs, refit_names, positions, train_paths, spatial_cache, args.components,
     )
+    if terrain is not None:
+        inputs, refit_names, terrain_training, _ = terrain.append(inputs, refit_names, positions)
+        if sha256(args.terrain_lookup) != lookup_digest:
+            raise ValueError('The upwind terrain lookup changed during feature extraction.')
     if refit_names != feature_names:
         raise ValueError('Prediction and training feature schemas disagree.')
     valid_sample_hash = hashlib.sha256(positions.tobytes() + target.tobytes()).hexdigest()
@@ -431,6 +445,8 @@ def run(args):
         expert = expert_receipts[0]
         result.update(best_iteration=expert['trees'], final_n_estimators=expert['trees'],
                       fit_parameters=expert['fit_parameters'])
+    if terrain is not None:
+        result[TERRAIN] = {'lookup_sha256': lookup_digest, 'training': terrain_training, 'prediction': terrain_prediction}
     if args.backend == 'lightgbm':
         result['lightgbm_version'] = backend_version
         if full:
@@ -457,7 +473,8 @@ def main():
     parser.add_argument('--phase', choices=('A', 'B'), default='A')
     parser.add_argument('--seed', type=int)
     parser.add_argument('--components', choices=SUPPORTED_COMPONENTS, nargs='*', default=[])
-    parser.add_argument('--diagnostic', choices=COMPONENTS)
+    parser.add_argument('--diagnostic', choices=(*COMPONENTS, TERRAIN))
+    parser.add_argument('--terrain-lookup', type=Path)
     parser.add_argument('--local-wind-cache', type=Path, default=Path('/workspace/qhl/runs/companion_t1_local_wind'))
     parser.add_argument('--early-stop-days', type=int)
     parser.add_argument('--threads', type=int)
@@ -493,6 +510,8 @@ def main():
     if len(args.components) != len(set(args.components)):
         parser.error('--components cannot contain duplicates.')
     args.components = [component for component in SUPPORTED_COMPONENTS if component in args.components]
+    if TERRAIN in args.components and args.terrain_lookup is None:
+        parser.error('The upwind_terrain component requires --terrain-lookup.')
     if not args.smoke and args.seed not in ((A_SEED,) if args.phase == 'A' else B_SEEDS):
         parser.error('Seed is outside the registered seeds for this phase.')
     if args.diagnostic and (args.phase != 'A' or args.diagnostic not in args.components):
