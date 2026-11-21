@@ -229,6 +229,8 @@ def confirm_t3(args, recipe):
     for step, seed in enumerate(B_SEEDS, 1):
         target = directory / str(seed)
         if not target.is_dir():
+            action = '复用已存预测' if seed == A_SEED else '开始拟合树和迁移模型'
+            show_progress(directory, 'T3 配对确认', step - 1, len(B_SEEDS), f'seed={seed} {action}')
             if seed == A_SEED:
                 stage = Path(mkdtemp(dir=directory, prefix=f'.{seed}.attempt-'))
                 tree, transfer, fit = reference, neural, {'reuse': provenance}
@@ -266,7 +268,11 @@ def confirm_t3(args, recipe):
               'identical_seed_groups': duplicated, 'active_recipe': recipe['candidate'] if acceptance['accepted'] else recipe['baseline']}
     freeze_json(directory / 'score.json', report)
     print(f'[T3 {WINDOW}] 每种子分差 ' + ', '.join(f'{seed} {row["delta"]:+.6f}' for seed, row in scores.items()), flush=True)
-    print(f'[T3 {WINDOW}] 集成分差 {overall["delta"]:+.6f}，当前实验基线 {report["active_recipe"]}', flush=True)
+    baseline, candidate = (overall['scores'][arm][PRIMARY_SCORE] for arm in ('baseline', 'candidate'))
+    interval = acceptance['paired_t_95_interval']
+    print(f'[T3 {WINDOW}] 集成 基线 {baseline:.6f}，候选 {candidate:.6f}，分差 {overall["delta"]:+.6f}，'
+          f'配对 95% 区间 [{interval[0]:+.6f}, {interval[1]:+.6f}]', flush=True)
+    print(f'[T3 {WINDOW}] 当前实验基线 {report["active_recipe"]}', flush=True)
     return {'name': report['active_recipe'], 'ensemble_delta': overall['delta'], 'acceptance': acceptance,
             'report_sha256': sha256(directory / 'score.json')}
 
@@ -275,27 +281,32 @@ def run(args):
     policy = read_json(args.policy)
     if policy['split_sha256'] != sha256(args.split):
         raise ValueError('The working-baseline contract uses a different warm split.')
+    warm_tracks = () if args.t3_only else ('T1', 'T2')
     freeze_json(args.out / 'setup.json', {'policy_sha256': sha256(args.policy),
                                          'data_root': str(args.data_root.resolve()),
                                          'blend_source': str(args.blends.resolve()), 'code_sha256': sha256(SCRIPT),
+                                         'tracks': [*warm_tracks, 'T3'],
                                          'device': args.device, 'threads': args.threads})
-    roster = load_roster(args.data_root)
+    steps = len(warm_tracks) + 1
     summary = {}
-    for index, track in enumerate(('T1', 'T2')):
-        show_progress(args.out, '基线确认', index, 3, f'{track} 核验并固化预测')
-        summary[track] = freeze_warm(args, policy, track, roster)
-        write_json(args.out / 'summary.json', summary)
-    show_progress(args.out, '基线确认', 2, 3, 'T3 补跑种子并核验三组配对')
+    if warm_tracks:
+        roster = load_roster(args.data_root)
+        for index, track in enumerate(warm_tracks):
+            show_progress(args.out, '基线确认', index, steps, f'{track} 核验并固化预测')
+            summary[track] = freeze_warm(args, policy, track, roster)
+            write_json(args.out / 'summary.json', summary)
+    show_progress(args.out, '基线确认', steps - 1, steps, 'T3 补跑种子并核验三组配对')
     summary['T3'] = confirm_t3(args, policy['T3'])
     write_json(args.out / 'summary.json', summary)
-    show_progress(args.out, '基线确认', 3, 3, '全部完成')
+    show_progress(args.out, '基线确认', steps, steps, '全部完成')
     print(f'报告目录 {args.out}', flush=True)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     runs = Path('/workspace/qhl/runs')
-    parser.add_argument('--out', type=Path, default=runs / 'confirmed_baselines_gpu_v2')
+    parser.add_argument('--out', type=Path)
+    parser.add_argument('--t3-only', action='store_true', help='Run only the fixed-window T3 confirmation.')
     parser.add_argument('--blends', type=Path, default=runs / 'forecast_blends_gpu_v1')
     parser.add_argument('--short-tree', type=Path, default=runs / 'three_track_gpu_batch_v1' / 'T3')
     parser.add_argument('--transfer-run', type=Path, default=runs / 'same_issue_followup_v1' / 'T3')
@@ -311,6 +322,10 @@ def main():
     parser.add_argument('--threads', type=int, choices=range(1, 5), default=4)
     parser.add_argument('--transfer-worker', type=int, choices=B_SEEDS)
     args = parser.parse_args()
+    if args.out is None:
+        if args.transfer_worker is not None:
+            parser.error('--transfer-worker requires --out.')
+        args.out = runs / ('t3_transfer_confirmation_gpu_v1' if args.t3_only else 'confirmed_baselines_gpu_v2')
     args.mlp_weather_python = None
     if args.transfer_worker is not None:
         transfer_worker(args)
