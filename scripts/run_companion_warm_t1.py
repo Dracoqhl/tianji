@@ -14,6 +14,7 @@ from unittest.mock import patch
 import numpy as np
 import pandas as pd
 
+from companion_spatial_features import SPATIAL_COMPONENTS, StationNeighborCache, extend_spatial
 from companion_t1_features import COMPONENTS, LocalWindCache, add_components, station_day_weights
 from score_forecasts import CAPACITY_MW, MAX_PREDICTION, score_track
 from tree_model import best_iteration, check_backend, fitted_device, lightgbm_progress, predict_tree
@@ -84,6 +85,7 @@ SMOKE_TRAIN_DAYS = 20
 SMOKE_VALIDATION_DAYS = 10
 SMOKE_MAX_ROUNDS = 20
 FORECAST_PARTITIONS = {'full': ((1, 96),), 'halves': ((1, 48), (49, 96))}
+SUPPORTED_COMPONENTS = (*COMPONENTS, *SPATIAL_COMPONENTS)
 
 
 def sha256(path):
@@ -290,9 +292,15 @@ def run(args):
     source_hashes = {fn.__name__: sha256(Path(getsourcefile(fn))) for fn in companion_functions}
     local_cache = (LocalWindCache(args.data_root, args.local_wind_cache, roster)
                    if 'local_wind' in args.components else None)
+    spatial_cache = (StationNeighborCache(args.data_root, args.local_wind_cache.parent / 'companion_station_neighbors',
+                                         roster, stations, spec)
+                     if any(name in SPATIAL_COMPONENTS for name in args.components) else None)
     prediction_positions = np.arange(len(keys), dtype=np.intp)
     predict_inputs, feature_names, diagnostic, prediction_local = add_components(
         predict_inputs, original_names, prediction_positions, prediction_paths, local_cache, args.components,
+    )
+    predict_inputs, feature_names, prediction_spatial = extend_spatial(
+        predict_inputs, feature_names, prediction_positions, prediction_paths, spatial_cache, args.components,
     )
 
     print(f'Reading training features for {len(train_paths)} selected dates', flush=True)
@@ -309,6 +317,9 @@ def run(args):
     del weather
     inputs, refit_names, _, training_local = add_components(
         inputs, original_names, positions, train_paths, local_cache, args.components,
+    )
+    inputs, refit_names, training_spatial = extend_spatial(
+        inputs, refit_names, positions, train_paths, spatial_cache, args.components,
     )
     if refit_names != feature_names:
         raise ValueError('Prediction and training feature schemas disagree.')
@@ -399,6 +410,7 @@ def run(args):
         'data_root': str(args.data_root.resolve()), 'feature_workdir': str(args.workdir.resolve()),
         'feature_spec_sha256': sha256(spec_path), 'companion_cache_metadata_sha256': versions,
         'local_wind_cache': {'training': training_local, 'prediction': prediction_local},
+        'spatial_cache': {'training': training_spatial, 'prediction': prediction_spatial},
         'split_sha256': FROZEN_SPLIT, 'config_sha256': config_hash,
         'companion_source_sha256': source_hashes,
         'threads': args.threads, 'train_days': len(train_paths), 'forecast_days': len(prediction_paths),
@@ -444,7 +456,7 @@ def main():
     parser.add_argument('--split', type=Path, default=SPLIT_PATH)
     parser.add_argument('--phase', choices=('A', 'B'), default='A')
     parser.add_argument('--seed', type=int)
-    parser.add_argument('--components', choices=COMPONENTS, nargs='*', default=[])
+    parser.add_argument('--components', choices=SUPPORTED_COMPONENTS, nargs='*', default=[])
     parser.add_argument('--diagnostic', choices=COMPONENTS)
     parser.add_argument('--local-wind-cache', type=Path, default=Path('/workspace/qhl/runs/companion_t1_local_wind'))
     parser.add_argument('--early-stop-days', type=int)
@@ -480,7 +492,7 @@ def main():
         parser.error(f'Use at most {GPU_THREADS} CPU threads with CUDA.')
     if len(args.components) != len(set(args.components)):
         parser.error('--components cannot contain duplicates.')
-    args.components = [component for component in COMPONENTS if component in args.components]
+    args.components = [component for component in SUPPORTED_COMPONENTS if component in args.components]
     if not args.smoke and args.seed not in ((A_SEED,) if args.phase == 'A' else B_SEEDS):
         parser.error('Seed is outside the registered seeds for this phase.')
     if args.diagnostic and (args.phase != 'A' or args.diagnostic not in args.components):
