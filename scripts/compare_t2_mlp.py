@@ -163,7 +163,7 @@ print(json.dumps(report))
 """
 
 
-def select_mlp_runtime(args):
+def select_mlp_runtime(args, *, require_weather=True):
     torch_python, weather_python = None, None
     seen = set()
     for candidate in candidate_pythons(args):
@@ -174,7 +174,7 @@ def select_mlp_runtime(args):
             continue
         seen.add(python)
         want_torch = torch_python is None and (args.mlp_python is None or python == args.mlp_python.absolute())
-        want_weather = (weather_python is None
+        want_weather = (require_weather and weather_python is None
                         and (args.mlp_weather_python is None or python == args.mlp_weather_python.absolute()))
         if not (want_torch or want_weather):
             continue
@@ -197,12 +197,12 @@ def select_mlp_runtime(args):
         detail = [report.get('torch') or report.get('torch_error'),
                   report.get('weather') or report.get('weather_error')]
         print(f'[T2 环境] {python} {" | ".join(item for item in detail if item)}', flush=True)
-        if torch_python and weather_python:
+        if torch_python and (weather_python or not require_weather):
             return torch_python, weather_python
     missing = []
     if torch_python is None:
         missing.append(f'支持 {args.device} 的 PyTorch')
-    if weather_python is None:
+    if require_weather and weather_python is None:
         missing.append('NetCDF4')
     raise RuntimeError(f'当前服务器未找到 {"、".join(missing)} 环境。探测详情见 run.log。')
 
