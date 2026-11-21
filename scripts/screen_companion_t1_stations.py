@@ -12,7 +12,7 @@ from companion_t1_features import COMPONENTS
 from compare_warm_t1 import MINIMUM_GAIN, PRIMARY_SCORE, compare_pair, daily_scores
 from experiment_companion_t1 import RECIPE_FIELDS, assert_matched, event, fit_or_reuse, phase_versions, read_json, setup
 from run_companion_warm_t1 import A_SEED, SPLIT_PATH, date_roles, forecast_keys, sha256, training_block_dates, write_json
-from score_forecasts import POINT_KEYS, score_track
+from score_forecasts import DAY_KEYS, POINT_KEYS, score_track
 from warm_shared_power import labels, load_roster
 
 
@@ -26,11 +26,30 @@ SCREEN = 'station_screen.json'
 A_REPORT = 'a_station_routes.json'
 CPU_A_REFERENCE = 85.80038190973126
 STATION_RECIPE_FIELDS = tuple(key for key in RECIPE_FIELDS if key != 'early_stopping_days_inside_train')
+ST_TREE = 'st_tree_halves'
+CANDIDATE_SETS = {'features': COMPONENTS, 'st-tree': (ST_TREE,)}
+
+
+def fit_options(name):
+    if name == 'baseline':
+        return [], 'full'
+    if name == ST_TREE:
+        return [], 'halves'
+    return [name], 'full'
+
+
+def show_progress(out, stage, done, total, label):
+    width = 10
+    filled = width * done // total
+    bar = '█' * filled + '░' * (width - filled)
+    print(f'[{bar}] {stage} {done}/{total} {label}', flush=True)
+    write_json(out / 'progress.json', {'stage': stage, 'completed': done, 'total': total, 'last_step': label})
 
 
 def study_setup(args):
     return dict(setup(args), station_screen_sha256=sha256(Path(__file__)),
                 train_blocks=[[first.isoformat(), last.isoformat()] for first, last in BLOCKS],
+                candidate_set=args.candidate_set, candidates=list(CANDIDATE_SETS[args.candidate_set]),
                 station_gate={'minimum_gain_each_block': MINIMUM_GAIN, 'require_all_blocks': True})
 
 
@@ -41,13 +60,13 @@ def station_scores(truth, forecast):
             for row in by_station.itertuples()}
 
 
-def block_comparisons(truth, forecasts, roster):
+def block_comparisons(truth, forecasts, roster, candidates=COMPONENTS):
     diagnostics = {name: score_track('T1', truth, forecast, roster, allow_unscored_stations=True)
                    for name, forecast in forecasts.items()}
     scores = {name: station_scores(truth, forecast) for name, forecast in forecasts.items()}
     baseline = scores['baseline']
     rows = {}
-    for name in COMPONENTS:
+    for name in candidates:
         candidate = scores[name]
         rows[name] = {}
         for station in roster:
@@ -62,12 +81,12 @@ def block_comparisons(truth, forecasts, roster):
     return {'scores': diagnostics, 'station_pairs': rows}
 
 
-def station_routes(roster, block_reports):
+def station_routes(roster, block_reports, candidates=COMPONENTS):
     """Use each time block once in selection, including negative and unavailable results."""
     routes, comparisons = {}, {}
     for station in roster:
         rows = {}
-        for component in COMPONENTS:
+        for component in candidates:
             pair_rows = [report['station_pairs'][component][station] for report in block_reports]
             deltas = [row['delta'] for row in pair_rows]
             finite = [delta for delta in deltas if delta is not None]
@@ -79,7 +98,7 @@ def station_routes(roster, block_reports):
                                              isclose(delta, MINIMUM_GAIN, rel_tol=0, abs_tol=1e-12)
                                              for delta in finite),
             }
-        eligible = [component for component in COMPONENTS if rows[component]['eligible']]
+        eligible = [component for component in candidates if rows[component]['eligible']]
         if eligible:
             routes[station] = max(eligible, key=lambda component: rows[component]['mean_delta'])
         comparisons[station] = rows
@@ -118,6 +137,24 @@ def write_station_table(path, comparisons, routes):
     pending.replace(path)
 
 
+def noon_change_error(truth, forecasts):
+    """Measure a split-boundary jump only when both actual points are scored-valid."""
+    at_noon = truth.loc[truth['point_index'].isin((48, 49)) & truth['power_limit'].eq(1), [*POINT_KEYS, 'power']]
+    actual = at_noon.pivot(index=DAY_KEYS, columns='point_index', values='power').reindex(columns=[48, 49])
+    change = (actual[49] - actual[48]).dropna()
+    result = {}
+    for name, forecast in forecasts.items():
+        boundary = forecast.loc[forecast['point_index'].isin((48, 49))]
+        modeled = boundary.pivot(index=DAY_KEYS, columns='point_index', values='prediction')
+        error = ((modeled[49] - modeled[48]).reindex(change.index) - change).abs()
+        per_station = error.groupby(level='station_id').agg(['mean', 'size'])
+        result[name] = {'paired_station_days': len(error),
+                        'change_mae_mw': float(error.mean()) if len(error) else None,
+                        'per_station': {row.Index: {'change_mae_mw': float(row.mean), 'days': int(row.size)}
+                                        for row in per_station.itertuples()}}
+    return result
+
+
 def screen(args, settings):
     if (args.out / FREEZE).exists():
         frozen = verified_freeze(args, settings)
@@ -126,37 +163,48 @@ def screen(args, settings):
     roster = load_roster(args.data_root)
     reports = []
     recipe = None
+    candidates = settings['candidates']
+    completed = 0
+    total = len(BLOCKS) * (1 + len(candidates)) + 1
+    show_progress(args.out, '训练内配对', completed, total, '开始')
     for first, last in BLOCKS:
         train, held_out = training_block_dates(args.split, first, last)
         path = args.out / 'training_blocks' / first.isoformat()
         versions = phase_versions(args, train, held_out)
         keys = forecast_keys(held_out, roster)
         forecasts, receipts = {}, {}
-        for name, components in [('baseline', []), *((name, [name]) for name in COMPONENTS)]:
+        for name in ('baseline', *candidates):
             print(f'[训练内 {first}–{last}] {name}，{len(train)} 个拟合日', flush=True)
+            components, partition = fit_options(name)
             receipt, forecast, _ = fit_or_reuse(
                 args, path / name, keys, 'A', A_SEED, components, versions, train_block=(first, last),
+                point_partition=partition,
             )
             if receipts:
                 assert_matched(receipts['baseline'], receipt)
             forecasts[name], receipts[name] = forecast, receipt
+            completed += 1
+            show_progress(args.out, '训练内配对', completed, total, f'{first} {name} 预测已保存')
         # Every model is fit and every prediction is written before scoring this training block.
         truth = labels(args.data_root, held_out, roster)
         baseline = receipts['baseline']
         if recipe is None:
             recipe = {key: baseline[key] for key in STATION_RECIPE_FIELDS}
         assert_matched(recipe, baseline, STATION_RECIPE_FIELDS)
-        report = dict(block_comparisons(truth, forecasts, roster),
+        report = dict(block_comparisons(truth, forecasts, roster, candidates),
                       date_range=[first.isoformat(), last.isoformat()], training=receipts)
+        if ST_TREE in candidates:
+            report['point_48_to_49'] = noon_change_error(truth, forecasts)
         write_json(path / 'comparison.json', report)
         reports.append(report)
-    routes, comparisons = station_routes(roster, reports)
+    routes, comparisons = station_routes(roster, reports, candidates)
     study = {'settings': settings, 'blocks': reports, 'stations': comparisons, 'routes': routes, 'recipe': recipe}
     write_json(args.out / SCREEN, study)
     write_station_table(args.out / 'station_summary.csv', comparisons, routes)
     write_json(args.out / FREEZE, {'settings': settings, 'routes': routes, 'recipe': recipe,
                                     'screen_sha256': sha256(args.out / SCREEN)})
     print(f'[训练内筛选] 冻结场站与组件 {routes}', flush=True)
+    show_progress(args.out, '训练内配对', total, total, '逐站计分与映射冻结完成')
 
 
 def combine_forecasts(baseline, candidates, routes):
@@ -187,16 +235,22 @@ def confirm_a(args, settings):
     keys = forecast_keys(held_out, roster)
     versions = phase_versions(args, train, held_out)
     directory = args.out / 'a'
+    used = [name for name in settings['candidates'] if name in routes.values()]
+    total = 2 + len(used)
+    show_progress(args.out, 'A 集复核', 0, total, '开始')
     print('[A] Fit the matched GPU baseline', flush=True)
     baseline_receipt, baseline, _ = fit_or_reuse(args, directory / 'baseline', keys, 'A', A_SEED, [], versions)
     assert_matched(frozen['recipe'], baseline_receipt, STATION_RECIPE_FIELDS)
     receipts, candidates = {'baseline': baseline_receipt}, {}
-    for name in COMPONENTS:
-        if name in routes.values():
-            print(f'[A] Refit for frozen station route {name}', flush=True)
-            receipt, forecast, _ = fit_or_reuse(args, directory / name, keys, 'A', A_SEED, [name], versions)
-            assert_matched(baseline_receipt, receipt)
-            receipts[name], candidates[name] = receipt, forecast
+    show_progress(args.out, 'A 集复核', 1, total, '基线预测已保存')
+    for index, name in enumerate(used, 2):
+        print(f'[A] Refit for frozen station route {name}', flush=True)
+        components, partition = fit_options(name)
+        receipt, forecast, _ = fit_or_reuse(args, directory / name, keys, 'A', A_SEED, components, versions,
+                                            point_partition=partition)
+        assert_matched(baseline_receipt, receipt)
+        receipts[name], candidates[name] = receipt, forecast
+        show_progress(args.out, 'A 集复核', index, total, f'{name} 预测已保存')
     composite = combine_forecasts(baseline, candidates, routes)
     forecast_path = directory / 'station_composite_T1_development.csv'
     pending = forecast_path.with_suffix('.tmp')
@@ -211,12 +265,15 @@ def confirm_a(args, settings):
         raise ValueError('The locked A scoring cohort differs from the registered warm A cohort.')
     report.update(routes=routes, freeze_sha256=freeze_digest, prediction_sha256=forecast_digest, training=receipts,
                   historical_lightgbm_reference=CPU_A_REFERENCE)
+    if ST_TREE in used:
+        report['point_48_to_49'] = noon_change_error(truth, {'baseline': baseline, 'candidate': composite})
     write_json(report_path, report)
     print(f'[A] {args.backend}/{args.device} 基线 {cohort[PRIMARY_SCORE]:.6f}，'
           f'逐站组合 {report["scores"]["candidate"][PRIMARY_SCORE]:.6f}，'
           f'总分差 {report["delta"][PRIMARY_SCORE]:+.6f}', flush=True)
     for station, name in routes.items():
         print(f'[A] {station} {name} {report["per_station_readme"][station]["delta"]:+.6f}', flush=True)
+    show_progress(args.out, 'A 集复核', total, total, '计分完成')
 
 
 def main():
@@ -228,6 +285,7 @@ def main():
     parser.add_argument('--config', type=Path)
     parser.add_argument('--split', type=Path, default=SPLIT_PATH)
     parser.add_argument('--out', type=Path, default=Path('/workspace/qhl/runs/t1_station_screen_gpu_v1'))
+    parser.add_argument('--candidate-set', choices=CANDIDATE_SETS, default='features')
     parser.add_argument('--local-wind-cache', type=Path, default=Path('/workspace/qhl/runs/companion_t1_local_wind'))
     parser.add_argument('--device', choices=('cpu', 'cuda'), default='cuda')
     parser.add_argument('--threads', type=int, default=4)
