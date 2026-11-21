@@ -193,14 +193,14 @@ def normalize(train, development):
     return transform(train), transform(development), means, scales
 
 
-def fit_power(train, target, valid, devel, epochs, batch, device_name, progress):
+def fit_power(train, target, valid, devel, epochs, batch, device_name, progress, *, seed=SEED):
     import torch
     from torch import nn
 
     if device_name == 'cuda' and not torch.cuda.is_available():
         raise RuntimeError('PyTorch CUDA is unavailable. Use --device cpu only for a deliberate CPU run.')
     torch.set_num_threads(4)
-    torch.manual_seed(SEED)
+    torch.manual_seed(seed)
     device = torch.device(device_name)
     if device.type == 'cuda':
         torch.cuda.reset_peak_memory_stats(device)
@@ -295,9 +295,8 @@ def checkpoint_devices(path):
     return sorted(locations)
 
 
-def run(root, split, out, workers, epochs, batch, device, dataset_factory=None, cache_root=None):
-    roles = manifest_days(split)
-    train_days, dev_days = roles['train'], roles['development']
+def fit_forecasts(root, out, train_days, dev_days, workers, epochs, batch, device, *,
+                  dataset_factory=None, cache_root=None, seed=SEED, forecast_tag='development'):
     start = monotonic()
     def progress(message):
         print(f'[{monotonic() - start:.1f}s] {message}', flush=True)
@@ -320,7 +319,9 @@ def run(root, split, out, workers, epochs, batch, device, dataset_factory=None, 
     assembly_seconds = monotonic() - assembly_start
 
     train_start = monotonic()
-    network, predict, trajectory, device_label, peak = fit_power(train, actual, valid_mask, development, epochs, batch, device, progress)
+    network, predict, trajectory, device_label, peak = fit_power(
+        train, actual, valid_mask, development, epochs, batch, device, progress, seed=seed,
+    )
     train_seconds = monotonic() - train_start
 
     import torch
@@ -332,20 +333,28 @@ def run(root, split, out, workers, epochs, batch, device, dataset_factory=None, 
     predictions['point_index'] = np.tile(np.arange(1, 97), len(days))
     predictions['prediction'] = power.ravel()
     energy = days.assign(energy=0.25 * power.sum(axis=1))
-    predictions.to_csv(out / 'T1_development.csv', index=False)
-    energy.to_csv(out / 'T2_development.csv', index=False)
+    predictions.to_csv(out / f'T1_{forecast_tag}.csv', index=False)
+    energy.to_csv(out / f'T2_{forecast_tag}.csv', index=False)
     torch.save({'model': network.state_dict(), 'feature_columns': columns, 'mean': means.tolist(),
-                'scale': scales.tolist(), 'seed': SEED}, out / 'power_model.pt')
+                'scale': scales.tolist(), 'seed': seed}, out / 'power_model.pt')
     inference_seconds = monotonic() - inference_start
 
     report = {'data_root': str(root), 'split_sha256': FROZEN_SPLIT, 'train_days': len(train_days), 'development_days': len(dev_days),
-              'seed': SEED, 'epochs': epochs, 'train_valid_points': int(valid_mask.sum()), 'weather_features': columns,
+              'seed': seed, 'epochs': epochs, 'train_valid_points': int(valid_mask.sum()), 'weather_features': columns,
               'train_daily_rmse_mw': trajectory, 'device': device_label, 'peak_training_gpu_bytes': peak,
               'device_requested': device, 'batch_station_days': batch,
               'feature_workers': workers, 'feature_cache_hits': cache_hits, 'feature_cache_version': cache_version,
               'phase_seconds': {'weather_and_cache': weather_seconds, 'assembly_and_labels': assembly_seconds,
                                 'training': train_seconds, 'prediction_and_export': inference_seconds}}
     (out / 'training_receipt.json').write_text(json.dumps(report, indent=2, allow_nan=False) + '\n')
+    return report
+
+
+def run(root, split, out, workers, epochs, batch, device, dataset_factory=None, cache_root=None):
+    roles = manifest_days(split)
+    train_days, dev_days = roles['train'], roles['development']
+    report = fit_forecasts(root, out, train_days, dev_days, workers, epochs, batch, device,
+                           dataset_factory=dataset_factory, cache_root=cache_root)
     score_saved(root, dev_days, out, report)
 
 
@@ -359,8 +368,14 @@ def main():
     parser.add_argument('--workers', type=int, default=8)
     parser.add_argument('--epochs', type=int, default=16)
     parser.add_argument('--batch-station-days', type=int, default=64)
+    parser.add_argument('--predict-b', action='store_true', help='Fit on train+A and export B forecasts.')
+    parser.add_argument('--seed', type=int)
     parser.add_argument('--score-only', action='store_true', help='Score frozen predictions in --out without extracting features or training.')
     args = parser.parse_args()
+    if args.predict_b and args.score_only:
+        parser.error('--predict-b and --score-only are separate modes.')
+    if args.seed is not None and not args.predict_b:
+        parser.error('--seed is for B predictions only.')
     if args.score_only:
         days = manifest_days(args.split)['development']
         receipt = args.out / 'training_receipt.json'
@@ -388,6 +403,18 @@ def main():
             parser.error('PyTorch cannot access CUDA in this environment.')
         torch.zeros(1, device='cuda').item()
         print(f'PyTorch CUDA verified: {torch.cuda.get_device_name(0)}; CPU feature workers: {args.workers}', flush=True)
+    if args.predict_b:
+        from run_companion_warm_t1 import B_SEEDS, date_roles
+
+        if args.seed not in B_SEEDS:
+            parser.error('--predict-b requires one of the registered B seeds.')
+        train, forecast = date_roles(args.split, 'B')
+        if args.epochs != 16 or args.batch_station_days != 64:
+            parser.error('Use the original MLP schedule of 16 epochs and batches of 64 station-days.')
+        fit_forecasts(args.data_root, args.out, train, forecast, args.workers, args.epochs,
+                      args.batch_station_days, args.device, cache_root=args.cache_root,
+                      seed=args.seed, forecast_tag='sealed')
+        return
     run(args.data_root, args.split, args.out, args.workers, args.epochs, args.batch_station_days, args.device,
         cache_root=args.cache_root)
 
