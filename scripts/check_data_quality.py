@@ -190,15 +190,17 @@ def scan_obs(training, station_count):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--data-root', type=Path, default=Path('/workspace/data'))
+    parser.add_argument('--data-root', type=Path, default=Path('/workspace/qhl/data'))
     parser.add_argument('--nwp-days', type=int, default=12, help='Training dates spread over available dates (plus up to 3 documented dates).')
     args = parser.parse_args()
     if args.nwp_days < 1:
         parser.error('--nwp-days must be positive')
+    root = args.data_root
+    if not all((root / name).is_dir() for name in ('train', 'test', 'static')):
+        parser.error(f'{root} must contain train, test and static')
     from netCDF4 import Dataset
 
     start = monotonic()
-    root = args.data_root
     days = sorted(path for path in (root / 'train').glob('????????_0000')
                   if path.is_dir() and path.name[:8].isdigit())
     test = sorted(p for p in (root / 'test').iterdir() if p.is_dir())
@@ -212,6 +214,7 @@ def main():
         raise ValueError('Power station coordinates must be present and finite.')
     obs_stations = len(pd.read_csv(root / 'static/obs_stations.csv'))
     report = {
+        'data_root': str(root),
         'training_days': len(days), 'training_weather_sample_days': len(training_sample),
         'test_layout_sample_days': len(test_layout_sample),
         'train_power_quality': scan_power(days),
