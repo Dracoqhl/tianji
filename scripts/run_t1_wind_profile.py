@@ -24,7 +24,7 @@ def meets_gain(value):
     return value >= MINIMUM_GAIN or isclose(value, MINIMUM_GAIN, rel_tol=0, abs_tol=1e-12)
 
 
-def b_gate(report, frozen, roster):
+def b_gate(report, frozen, roster, components=PROFILE_COMPONENTS):
     """A confirms training-screened sites; B assesses their gains individually."""
     baseline = report['scores']['baseline'][PRIMARY_SCORE]
     site_evidence = {station: report['per_station_readme'][station]['delta'] for station in frozen['routes']}
@@ -36,8 +36,8 @@ def b_gate(report, frozen, roster):
                 'routes': confirmed, 'recipe': frozen['recipe'], 'a_screened_station_deltas': site_evidence}
 
     scores = {'baseline': report['scores']['baseline'],
-              **{name: report['full_components'][name]['scores']['candidate'] for name in PROFILE_COMPONENTS}}
-    gate = choose_gate(scores, 'baseline', ('baseline', *PROFILE_COMPONENTS))
+              **{name: report['full_components'][name]['scores']['candidate'] for name in components}}
+    gate = choose_gate(scores, 'baseline', ('baseline', *components))
     return {**gate, 'routes': dict.fromkeys(roster, gate['candidate']), 'recipe': frozen['recipe'],
             'a_screened_station_deltas': site_evidence}
 
@@ -53,6 +53,20 @@ def b_station_decisions(result, sites):
         comparisons[site] = {'component': component, 'seed_deltas': deltas, 'statistics': rule,
                              'accepted': rule['accepted'] and meets_gain(ensemble)}
     return comparisons
+
+
+def print_b_decision(args, result, gate):
+    if not result:
+        return
+    if gate['candidate'] == 'confirmed_stations':
+        decisions = b_station_decisions(result, gate['routes'])
+        accepted = {site: row['component'] for site, row in decisions.items() if row['accepted']}
+        write_json(args.out / 'B/T1/station_acceptance.json', {'decisions': decisions, 'adopted_routes': accepted,
+                                                             'prediction_lock_sha256': result['prediction_lock_sha256']})
+        print(f'[B] 逐站采纳 {accepted}', flush=True)
+    else:
+        print(f'[B] 全站采纳 {result["acceptance"]["accepted"]}', flush=True)
+    print(f'[B] 集成差 {result["ensemble"]["delta"][PRIMARY_SCORE]:+.6f}', flush=True)
 
 
 def increments(frame, values):
@@ -162,16 +176,7 @@ def execute(args):
     runtime = {'launcher_sha256': sha256(Path(__file__)), 'code_sha256': code_version(),
                'split_sha256': sha256(args.split)}
     result = frozen_station_b(args, gate, runtime)
-    if result:
-        if gate['candidate'] == 'confirmed_stations':
-            decisions = b_station_decisions(result, gate['routes'])
-            accepted = {site: row['component'] for site, row in decisions.items() if row['accepted']}
-            write_json(args.out / 'B/T1/station_acceptance.json', {'decisions': decisions, 'adopted_routes': accepted,
-                                                                 'prediction_lock_sha256': result['prediction_lock_sha256']})
-            print(f'[B] 逐站采纳 {accepted}', flush=True)
-        else:
-            print(f'[B] 全站采纳 {result["acceptance"]["accepted"]}', flush=True)
-        print(f'[B] 集成差 {result["ensemble"]["delta"][PRIMARY_SCORE]:+.6f}', flush=True)
+    print_b_decision(args, result, gate)
     show_progress(args.out, '风廓线', 3, 3, '完成')
     print(f'报告目录 {args.out}', flush=True)
 
