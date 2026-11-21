@@ -23,7 +23,7 @@ def cache_paths(workdir, days):
     return paths
 
 
-def row_positions(meta, station_indices, n_days, *, phase, require_full, feature_rows):
+def row_positions(meta, station_indices, n_days, *, phase, feature_rows):
     station_indices = [int(index) for index in station_indices]
     stations = {index: i for i, index in enumerate(station_indices)}
     axes = {name: np.asarray(meta[name]) for name in ('day_idx', 'station_idx', 'point_idx')}
@@ -51,9 +51,56 @@ def row_positions(meta, station_indices, n_days, *, phase, require_full, feature
     stats['rows_per_day_min'] = int(rows_by_day.min())
     stats['rows_per_day_max'] = int(rows_by_day.max())
     print(f'{phase} keys: {json.dumps(stats)}', flush=True)
-    if stats['duplicate_rows'] or (require_full and stats['missing_grid_keys']):
-        raise ValueError(f'{phase}: duplicate row keys, or incomplete prediction grid. Key counts printed above.')
+    if stats['duplicate_rows']:
+        raise ValueError(f'{phase}: duplicate row keys. Key counts printed above.')
     return positions, days, stats
+
+
+def context_values(inputs, positions, size, column):
+    indices, first = np.unique(positions, return_index=True)
+    values = inputs[first, column]
+    if len(indices) != size or not np.isfinite(values).all() or not np.array_equal(values[positions], inputs[:, column]):
+        raise ValueError('Development rows cannot establish the companion station or point feature convention.')
+    return values
+
+
+def complete_development_rows(paths, stations, roster, spec, names, inputs, positions):
+    """Recover points omitted by the row builder using only cached weather inputs."""
+    n_stations, n_points = len(stations), 96
+    station_rows = np.asarray(stations, dtype=np.intp)
+    feature_groups = {'nwp_point': 'nwp_names', 'static': 'static_names',
+                      'sat': 'sat_names', 'obs': 'obs_names'}
+    context = ('station_idx', 'point_index', 'local_hour')
+    expected_names = [name for group in feature_groups.values() for name in spec[group]] + list(context)
+    if len(names) != len(set(names)) or sorted(names) != sorted(expected_names) or inputs.shape[1] != len(names):
+        raise ValueError('Development feature columns differ from the companion cache schema.')
+    columns = {name: index for index, name in enumerate(names)}
+    station_slots = positions // n_points % n_stations
+    point_slots = positions % n_points
+    station_values = context_values(inputs, station_slots, n_stations, columns['station_idx'])
+    point_values = {name: context_values(inputs, point_slots, n_points, columns[name]) for name in context[1:]}
+    full = np.empty((len(paths), n_stations, n_points, len(names)), dtype=inputs.dtype)
+    full[..., columns['station_idx']] = station_values[:, None]
+    for name, values in point_values.items():
+        full[..., columns[name]] = values
+    for day, path in enumerate(paths):
+        with np.load(path, allow_pickle=False) as cache:
+            if cache['date_code'].tolist() != [path.stem] or cache['station_ids'][station_rows].tolist() != roster:
+                raise ValueError(f'{path.name}: cached date or station order disagrees with the development grid.')
+            for array_name, group in feature_groups.items():
+                values = cache[array_name][station_rows]
+                group_columns = [columns[name] for name in spec[group]]
+                expected_shape = (n_stations, n_points, len(group_columns)) if array_name == 'nwp_point' else (n_stations, len(group_columns))
+                if values.shape != expected_shape:
+                    raise ValueError(f'{path.name}: {array_name} has shape {values.shape}, expected {expected_shape}.')
+                full[day][..., group_columns] = values if array_name == 'nwp_point' else values[:, None, :]
+
+    full = full.reshape(-1, len(names))
+    # Establish parity on rows the companion loader already built before using the added ones.
+    for column, name in enumerate(names):
+        if not np.array_equal(full[positions, column], inputs[:, column], equal_nan=True):
+            raise ValueError(f'Development feature {name} differs between the row builder and cache.')
+    return full
 
 
 def training_targets(root, dates, roster, positions, phase):
@@ -85,14 +132,23 @@ def run(args):
         raise ValueError('The companion station roster differs from the qhl submission template.')
     train_paths = cache_paths(args.workdir, train_days)
     dev_paths = cache_paths(args.workdir, dev_days)
+    spec_path = args.workdir / 'stats' / 'feature_spec_train.json'
+    spec = load_feature_spec(args.workdir, 'train')
+    feature_names = gbdt_feature_names(spec)
     start = monotonic()
     # Check the development grid before the large training assembly and before fitting.
     print(f'Checking prediction keys for {len(dev_paths)} development dates', flush=True)
     dev_inputs, _, dev_metadata = build_gbdt_rows(dev_paths, stations, CAPACITY_MW,
                                                 include_invalid=True, verbose=True)
     dev_positions, _, dev_key_stats = row_positions(dev_metadata, stations, len(dev_days),
-                                                    phase='development', require_full=True, feature_rows=len(dev_inputs))
+                                                    phase='development', feature_rows=len(dev_inputs))
     del dev_metadata
+    dev_key_stats['rows_recovered_from_cache'] = dev_key_stats['missing_grid_keys']
+    if dev_key_stats['missing_grid_keys']:
+        dev_inputs = complete_development_rows(dev_paths, stations, roster, spec, feature_names, dev_inputs, dev_positions)
+        dev_positions = np.arange(len(dev_inputs), dtype=np.intp)
+        print(f"Restored {dev_key_stats['rows_recovered_from_cache']} rows from weather caches. "
+              f"All supplied feature values match on {dev_key_stats['rows']} original rows.", flush=True)
     if args.check_only:
         sample_indices = sorted({0, len(train_days) // 2, len(train_days) - 1})
         sample_days = [train_days[i] for i in sample_indices]
@@ -100,13 +156,11 @@ def run(args):
         check_matrix, _, check_meta = build_gbdt_rows(sample_paths, stations, CAPACITY_MW,
                                                       include_invalid=True, verbose=False)
         check_positions, _, _ = row_positions(check_meta, stations, len(sample_paths),
-                                               phase='sampled training', require_full=False, feature_rows=len(check_matrix))
+                                               phase='sampled training', feature_rows=len(check_matrix))
         training_targets(args.data_root, sample_days, roster, check_positions, 'sampled training')
         print('Development grid and sampled training coverage passed.', flush=True)
         return
     cfg = load_config(str(args.config or args.companion_code / 'configs' / 'default.json'))
-    spec_path = args.workdir / 'stats' / 'feature_spec_train.json'
-    feature_names = gbdt_feature_names(load_feature_spec(args.workdir, 'train'))
     spec_hash = hashlib.sha256(spec_path.read_bytes()).hexdigest()
     params = dict(cfg['gbdt'])
     if args.threads:
@@ -115,7 +169,7 @@ def run(args):
     print(f'Reading training features for {len(train_paths)} selected dates', flush=True)
     weather, _, metadata = build_gbdt_rows(train_paths, stations, CAPACITY_MW, include_invalid=True, verbose=True)
     positions, day_idx, train_key_stats = row_positions(metadata, stations, len(train_days),
-                                                       phase='training', require_full=False, feature_rows=len(weather))
+                                                       phase='training', feature_rows=len(weather))
     target, valid = training_targets(args.data_root, train_days, roster, positions, 'training')
     del positions, metadata
     inputs = np.ascontiguousarray(weather[valid], dtype=np.float32)
