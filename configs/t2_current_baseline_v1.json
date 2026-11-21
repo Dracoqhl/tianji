@@ -1,0 +1,12 @@
+{
+  "track": "T2",
+  "name": "mlp_relative_75_25",
+  "components": {"mlp_integral": 0.75, "relative_mse": 0.25},
+  "adopted_scope": "current experiment baseline",
+  "split_sha256": "ac5708425e3ed19d9975732a9d3aac965cc95d6a047d0c49862422b45fbbb837",
+  "a_run": "/workspace/qhl/runs/t2_mlp_comparison_v1",
+  "a_forecasts": "A/predictions_frozen.json",
+  "a_score": "A/score.json",
+  "b_score": "B/T2/score.json",
+  "evidence": {"b_score": 68.856920, "b_delta_vs_mlp": 2.452471, "paired_seed_deltas": [3.070571, 2.167604, 2.640185]}
+}
