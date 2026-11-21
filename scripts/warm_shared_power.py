@@ -9,6 +9,7 @@ from inspect import getsource
 import json
 import multiprocessing
 from pathlib import Path
+import pickle
 from time import monotonic
 
 import numpy as np
@@ -201,6 +202,8 @@ def fit_power(train, target, valid, devel, epochs, batch, device_name, progress)
     torch.set_num_threads(4)
     torch.manual_seed(SEED)
     device = torch.device(device_name)
+    if device.type == 'cuda':
+        torch.cuda.reset_peak_memory_stats(device)
     network = nn.Sequential(nn.Linear(train.shape[-1], 96), nn.LayerNorm(96), nn.SiLU(),
                             nn.Linear(96, 96), nn.SiLU(), nn.Linear(96, 1)).to(device)
     optimizer = torch.optim.AdamW(network.parameters(), lr=0.0015, weight_decay=0.001)
@@ -210,6 +213,7 @@ def fit_power(train, target, valid, devel, epochs, batch, device_name, progress)
     features = torch.as_tensor(train[keep], device=device)
     truth = torch.as_tensor(np.where(valid, target / POWER_CAP, 0)[keep], dtype=torch.float32, device=device)
     mask = torch.as_tensor(valid[keep], device=device)
+    progress(f'Model and training arrays on {features.device}, stations-days per batch {batch}, dtype {features.dtype}')
     trajectory = []
     for epoch in range(1, epochs + 1):
         permutation = torch.randperm(len(features), device=device)
@@ -238,6 +242,59 @@ def fit_power(train, target, valid, devel, epochs, batch, device_name, progress)
     return network, predict, trajectory, device_label, train_memory
 
 
+def load_roster(root):
+    roster = sorted(pd.read_csv(root / 'submission/T1_dataset/submission_template.csv',
+                                usecols=['station_id'], dtype={'station_id': str})['station_id'].unique().tolist())
+    second_roster = set(pd.read_csv(root / 'submission/T2_dataset/submission_template.csv',
+                                   usecols=['station_id'], dtype={'station_id': str})['station_id'])
+    if len(roster) != 12 or set(roster) != second_roster:
+        raise ValueError('The T1 and T2 templates must have the same 12-station roster.')
+    return roster
+
+
+def score_saved(root, dev_days, out, report):
+    start = monotonic()
+    if not (out / 'power_model.pt').is_file():
+        raise ValueError('Expected the saved power_model.pt and both development prediction CSVs.')
+    roster = load_roster(root)
+    dtype = {'station_id': str, 'date': str}
+    predictions = pd.read_csv(out / 'T1_development.csv', dtype=dtype)
+    energy = pd.read_csv(out / 'T2_development.csv', dtype=dtype)
+    keys = ['station_id', 'date']
+    integrated = predictions.groupby(keys)['prediction'].sum() * 0.25
+    energy_indexed = energy.set_index(keys)['energy']
+    if not energy_indexed.index.is_unique:
+        raise ValueError('Saved T2 forecasts contain duplicate station-days.')
+    energy_aligned = energy_indexed.reindex(integrated.index)
+    if len(energy) != len(integrated) or not np.allclose(integrated, energy_aligned, rtol=0, atol=1e-9):
+        raise ValueError('Saved T2 forecasts do not equal the integral of the saved T1 curves.')
+    # Read development labels only after both forecasts and the shared model exist.
+    truth = labels(root, dev_days, roster)
+    report['scores'] = {
+        'T1': score_track('T1', truth, predictions, roster),
+        'T2': score_track('T2', truth, energy, roster, allow_unscored_stations=True),
+    }
+    report.setdefault('phase_seconds', {})['scoring'] = monotonic() - start
+    report['t2_local_policy'] = 'Average stations with eligible days; undefined scores are omitted and listed.'
+    payload = json.dumps(report, indent=2, allow_nan=False) + '\n'
+    staging = out / 'results.json.tmp'
+    staging.write_text(payload)
+    staging.replace(out / 'results.json')
+    print(payload, end='', flush=True)
+
+
+def checkpoint_devices(path):
+    import torch
+
+    locations = set()
+    def remember_location(storage, location):
+        locations.add(location)
+        return storage
+
+    torch.load(path, map_location=remember_location, weights_only=True)
+    return sorted(locations)
+
+
 def run(root, split, out, workers, epochs, batch, device, dataset_factory=None, cache_root=None):
     roles = manifest_days(split)
     train_days, dev_days = roles['train'], roles['development']
@@ -245,12 +302,7 @@ def run(root, split, out, workers, epochs, batch, device, dataset_factory=None, 
     def progress(message):
         print(f'[{monotonic() - start:.1f}s] {message}', flush=True)
 
-    roster = sorted(pd.read_csv(root / 'submission/T1_dataset/submission_template.csv',
-                                usecols=['station_id'], dtype={'station_id': str})['station_id'].unique().tolist())
-    second_roster = set(pd.read_csv(root / 'submission/T2_dataset/submission_template.csv',
-                                   usecols=['station_id'], dtype={'station_id': str})['station_id'])
-    if len(roster) != 12 or set(roster) != second_roster:
-        raise ValueError('The T1 and T2 templates must have the same 12-station roster.')
+    roster = load_roster(root)
     stations = pd.read_csv(root / 'static/power_stations.csv', dtype={'station_id': str}).set_index('station_id')
     coordinates = stations.loc[roster, ['latitude', 'longitude']].to_numpy(dtype=float)
     weather, columns, cache_hits, cache_version = fetch_features(
@@ -286,20 +338,15 @@ def run(root, split, out, workers, epochs, batch, device, dataset_factory=None, 
                 'scale': scales.tolist(), 'seed': SEED}, out / 'power_model.pt')
     inference_seconds = monotonic() - inference_start
 
-    score_start = monotonic()
-    # Development labels are opened only after both predictions and the shared model are saved.
-    truth = labels(root, dev_days, roster)
-    scores = {'T1': score_track('T1', truth, predictions, roster), 'T2': score_track('T2', truth, energy, roster)}
     report = {'data_root': str(root), 'split_sha256': FROZEN_SPLIT, 'train_days': len(train_days), 'development_days': len(dev_days),
               'seed': SEED, 'epochs': epochs, 'train_valid_points': int(valid_mask.sum()), 'weather_features': columns,
               'train_daily_rmse_mw': trajectory, 'device': device_label, 'peak_training_gpu_bytes': peak,
+              'device_requested': device, 'batch_station_days': batch,
               'feature_workers': workers, 'feature_cache_hits': cache_hits, 'feature_cache_version': cache_version,
               'phase_seconds': {'weather_and_cache': weather_seconds, 'assembly_and_labels': assembly_seconds,
-                                'training': train_seconds, 'prediction_and_export': inference_seconds,
-                                'scoring': monotonic() - score_start}, 'scores': scores}
-    payload = json.dumps(report, indent=2, allow_nan=False) + '\n'
-    (out / 'results.json').write_text(payload)
-    print(payload, end='', flush=True)
+                                'training': train_seconds, 'prediction_and_export': inference_seconds}}
+    (out / 'training_receipt.json').write_text(json.dumps(report, indent=2, allow_nan=False) + '\n')
+    score_saved(root, dev_days, out, report)
 
 
 def main():
@@ -309,12 +356,28 @@ def main():
     parser.add_argument('--out', type=Path, default=Path('/workspace/qhl/runs/warm_shared_power_v1'))
     parser.add_argument('--cache-root', type=Path, default=Path('/workspace/qhl/runs/warm_power_feature_cache'))
     parser.add_argument('--device', choices=('cuda', 'cpu'), default='cuda')
-    parser.add_argument('--workers', type=int, default=4)
+    parser.add_argument('--workers', type=int, default=8)
     parser.add_argument('--epochs', type=int, default=16)
     parser.add_argument('--batch-station-days', type=int, default=64)
+    parser.add_argument('--score-only', action='store_true', help='Score frozen predictions in --out without extracting features or training.')
     args = parser.parse_args()
-    if not 1 <= args.workers <= 8 or min(args.epochs, args.batch_station_days) < 1:
-        parser.error('Use 1 to 8 feature workers and positive epochs and batch size.')
+    if args.score_only:
+        days = manifest_days(args.split)['development']
+        receipt = args.out / 'training_receipt.json'
+        report = json.loads(receipt.read_text()) if receipt.is_file() else {
+            'data_root': str(args.data_root), 'split_sha256': FROZEN_SPLIT, 'development_days': len(days),
+            'training_metadata': 'Original run did not save a training receipt.'}
+        if report['data_root'] != str(args.data_root) or report['split_sha256'] != FROZEN_SPLIT:
+            parser.error('Results directory belongs to a different data root or split.')
+        report['rescored_from_saved_predictions'] = True
+        try:
+            report['checkpoint_original_devices'] = checkpoint_devices(args.out / 'power_model.pt')
+        except (OSError, RuntimeError, ValueError, pickle.UnpicklingError, EOFError) as err:
+            report['checkpoint_device_probe_error'] = type(err).__name__
+        score_saved(args.data_root, days, args.out, report)
+        return
+    if not 1 <= args.workers <= 16 or min(args.epochs, args.batch_station_days) < 1:
+        parser.error('Use 1 to 16 feature workers and positive epochs and batch size.')
     args.out.mkdir(parents=True, exist_ok=True)
     if (args.out / 'results.json').exists():
         parser.error('Results already exist. Choose a new output directory for a new candidate.')
@@ -324,6 +387,7 @@ def main():
         if not torch.cuda.is_available():
             parser.error('PyTorch cannot access CUDA in this environment.')
         torch.zeros(1, device='cuda').item()
+        print(f'PyTorch CUDA verified: {torch.cuda.get_device_name(0)}; CPU feature workers: {args.workers}', flush=True)
     run(args.data_root, args.split, args.out, args.workers, args.epochs, args.batch_station_days, args.device,
         cache_root=args.cache_root)
 
