@@ -278,6 +278,38 @@ def paired_scores(args, track, gate, days, roster, predictions, manifest_digest)
     return result
 
 
+def frozen_station_b(args, gate, runtime):
+    gate_path = args.out / 'b_gate.json'
+    if gate_path.is_file() and read_json(gate_path) != gate:
+        raise ValueError('The A-based B enrollment changed.')
+    if not gate_path.is_file():
+        write_json(gate_path, gate)
+    print(f'[B 准入] {gate["candidate"]} A 差 {gate["a_delta"]:+.6f}，{gate["status"]}', flush=True)
+    if gate['status'] != 'promoted':
+        return None
+    train, days = date_roles(args.split, 'B')
+    if (len(train), len(days)) != (628, 92):
+        raise ValueError('Expected the frozen 628/92 B split.')
+    from types import SimpleNamespace
+
+    b_args = SimpleNamespace(**{**vars(args), 'out': args.out / 'B'})
+    b_args.out.mkdir(exist_ok=True)
+    roster = load_roster(args.data_root)
+    digest = lock_predictions(b_args, 'T1', gate, runtime, train, days, roster, build_fit=make_t1)
+    folder = b_args.out / 'T1'
+    forecasts = before_scoring(folder, 'T1', keys_for(days, roster, 'T1'), digest)
+    path = folder / 'score.json'
+    if path.is_file():
+        result = read_json(path)
+        if result['prediction_lock_sha256'] != digest:
+            raise ValueError('The B score uses a different prediction lock.')
+    else:
+        event(b_args.out, 'B', status='all_predictions_verified')
+        result = paired_scores(b_args, 'T1', gate, days, roster, forecasts, digest)
+        write_json(path, result)
+    return result
+
+
 def execute(args):
     train, days = date_roles(args.split, 'B')
     _, a_days = date_roles(args.split, 'A')
