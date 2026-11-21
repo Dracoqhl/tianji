@@ -9,9 +9,12 @@ from math import isclose
 from pathlib import Path
 
 from companion_t1_features import COMPONENTS
+from companion_spatial_features import SPATIAL_COMPONENTS
 from compare_warm_t1 import MINIMUM_GAIN, PRIMARY_SCORE, compare_pair, daily_scores
-from experiment_companion_t1 import RECIPE_FIELDS, assert_matched, event, fit_or_reuse, phase_versions, read_json, setup
+from experiment_companion_t1 import RECIPE_FIELDS, assert_matched, event, fit_or_reuse, load_run, phase_versions
+from experiment_companion_t1 import read_json, setup
 from run_companion_warm_t1 import A_SEED, SPLIT_PATH, date_roles, forecast_keys, sha256, training_block_dates, write_json
+from run_companion_warm_t1 import block_early_stop_days
 from score_forecasts import DAY_KEYS, POINT_KEYS, score_track
 from warm_shared_power import labels, load_roster
 
@@ -27,7 +30,7 @@ A_REPORT = 'a_station_routes.json'
 CPU_A_REFERENCE = 85.80038190973126
 STATION_RECIPE_FIELDS = tuple(key for key in RECIPE_FIELDS if key != 'early_stopping_days_inside_train')
 ST_TREE = 'st_tree_halves'
-CANDIDATE_SETS = {'features': COMPONENTS, 'st-tree': (ST_TREE,)}
+CANDIDATE_SETS = {'features': COMPONENTS, 'st-tree': (ST_TREE,), 'spatial': SPATIAL_COMPONENTS}
 
 
 def fit_options(name):
@@ -47,10 +50,60 @@ def show_progress(out, stage, done, total, label):
 
 
 def study_setup(args):
-    return dict(setup(args), station_screen_sha256=sha256(Path(__file__)),
+    result = dict(setup(args), station_screen_sha256=sha256(Path(__file__)),
                 train_blocks=[[first.isoformat(), last.isoformat()] for first, last in BLOCKS],
                 candidate_set=args.candidate_set, candidates=list(CANDIDATE_SETS[args.candidate_set]),
                 station_gate={'minimum_gain_each_block': MINIMUM_GAIN, 'require_all_blocks': True})
+    if getattr(args, 'baseline_run', None):
+        origin = frozen_pooled_origin(args.baseline_run)
+        result['baseline_origin'] = {key: origin[key] for key in ('freeze_sha256', 'a_sha256')}
+    return result
+
+
+def frozen_pooled_origin(path):
+    freeze = read_json(path / FREEZE)
+    a = read_json(path / A_REPORT)
+    if (freeze['screen_sha256'] != sha256(path / SCREEN) or a['freeze_sha256'] != sha256(path / FREEZE)):
+        raise ValueError('The frozen source of pooled predictions changed.')
+    screen = read_json(path / SCREEN)
+    return {'freeze_sha256': sha256(path / FREEZE), 'a_sha256': sha256(path / A_REPORT), 'a': a,
+            'blocks': {item['date_range'][0]: item for item in screen['blocks']}}
+
+
+def frozen_pooled_forecast(path, origin, name, train, held_out, keys, *, device):
+    if name == 'A':
+        expected = origin['a']['training']['baseline']
+        directory, scope = path / 'a', None
+    else:
+        block = origin['blocks'][name]
+        tags = [str(held_out[0]), str(held_out[-1])]
+        if block['date_range'] != tags:
+            raise ValueError('Forecast dates differ from the recorded baseline block.')
+        expected = block['training']['baseline']
+        directory = path / 'training_blocks' / name
+        scope = {'train_block': tags, 'train_days': len(train), 'forecast_days': len(held_out),
+                 'early_stopping_days_inside_train': block_early_stop_days(train)}
+    receipt, forecast, digest = load_run(directory / 'baseline', keys, 'A', A_SEED, [], backend='xgboost',
+                                         device=device, block_scope=scope)
+    if receipt != expected:
+        raise ValueError('The pooled forecast receipt differs from the frozen source.')
+    return receipt, forecast, digest
+
+
+def reference_fit(args, settings, name, directory, train, held_out, keys, versions, *, train_block=None):
+    if not args.baseline_run:
+        return fit_or_reuse(args, directory, keys, 'A', A_SEED, [], versions, train_block=train_block)
+    origin = frozen_pooled_origin(args.baseline_run)
+    if {key: origin[key] for key in ('freeze_sha256', 'a_sha256')} != settings['baseline_origin']:
+        raise ValueError('The pooled baseline origin differs from the study setup.')
+    receipt, forecast, digest = frozen_pooled_forecast(
+        args.baseline_run, origin, name, train, held_out, keys, device=args.device,
+    )
+    assert_matched(settings, receipt, ('data_root', 'config_sha256', 'backend', 'device', 'backend_version', 'threads'))
+    if receipt['companion_cache_metadata_sha256'] != versions:
+        raise ValueError('The pooled baseline weather cache differs from the candidate cache.')
+    print(f'Reusing the frozen pooled baseline for {name}', flush=True)
+    return receipt, forecast, digest
 
 
 def station_scores(truth, forecast):
@@ -176,10 +229,14 @@ def screen(args, settings):
         for name in ('baseline', *candidates):
             print(f'[训练内 {first}–{last}] {name}，{len(train)} 个拟合日', flush=True)
             components, partition = fit_options(name)
-            receipt, forecast, _ = fit_or_reuse(
-                args, path / name, keys, 'A', A_SEED, components, versions, train_block=(first, last),
-                point_partition=partition,
-            )
+            if name == 'baseline':
+                receipt, forecast, _ = reference_fit(args, settings, first.isoformat(), path / name,
+                                                     train, held_out, keys, versions, train_block=(first, last))
+            else:
+                receipt, forecast, _ = fit_or_reuse(
+                    args, path / name, keys, 'A', A_SEED, components, versions, train_block=(first, last),
+                    point_partition=partition,
+                )
             if receipts:
                 assert_matched(receipts['baseline'], receipt)
             forecasts[name], receipts[name] = forecast, receipt
@@ -239,7 +296,8 @@ def confirm_a(args, settings):
     total = 2 + len(used)
     show_progress(args.out, 'A 集复核', 0, total, '开始')
     print('[A] Fit the matched GPU baseline', flush=True)
-    baseline_receipt, baseline, _ = fit_or_reuse(args, directory / 'baseline', keys, 'A', A_SEED, [], versions)
+    baseline_receipt, baseline, _ = reference_fit(args, settings, 'A', directory / 'baseline',
+                                                  train, held_out, keys, versions)
     assert_matched(frozen['recipe'], baseline_receipt, STATION_RECIPE_FIELDS)
     receipts, candidates = {'baseline': baseline_receipt}, {}
     show_progress(args.out, 'A 集复核', 1, total, '基线预测已保存')
@@ -286,6 +344,7 @@ def main():
     parser.add_argument('--split', type=Path, default=SPLIT_PATH)
     parser.add_argument('--out', type=Path, default=Path('/workspace/qhl/runs/t1_station_screen_gpu_v1'))
     parser.add_argument('--candidate-set', choices=CANDIDATE_SETS, default='features')
+    parser.add_argument('--baseline-run', type=Path, help='Reuse a verified prior pooled baseline from the same date blocks.')
     parser.add_argument('--local-wind-cache', type=Path, default=Path('/workspace/qhl/runs/companion_t1_local_wind'))
     parser.add_argument('--device', choices=('cpu', 'cuda'), default='cuda')
     parser.add_argument('--threads', type=int, default=4)
