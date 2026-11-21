@@ -83,7 +83,7 @@ def adjust_short(encoder, predict, train, forecast, power, valid, roster, device
     return np.clip(final, 0, MAX_PREDICTION['T3']), heads
 
 
-def fit_models(args, source, regular, short, train, days, directory):
+def fit_models(args, source, regular, short, train, days, directory, *, seed=A_SEED, include_scratch=True):
     import torch
 
     def weather(dates, sites):
@@ -92,26 +92,30 @@ def fit_models(args, source, regular, short, train, days, directory):
     short_weather = weather([*train, *days], short)
     cut = len(train) * len(short)
     actual, valid = targets(args.data_root, train, short)
-    train_short, eval_short, _, _ = normalize(short_weather[:cut], short_weather[cut:])
-    print('[T3] 短历史站从头拟合', flush=True)
-    scratch, predict_scratch, scratch_loss, _, _ = fit_power(
-        train_short, actual, valid, eval_short, 16, 64, args.device, print, seed=A_SEED, network_factory=NETWORK,
-    )
-    scratch_prediction = predict_scratch()
-    torch.save(scratch.state_dict(), directory / 'scratch.pt')
-    del scratch, predict_scratch, train_short, eval_short
+    forecasts, receipt = {}, {}
+    if include_scratch:
+        train_short, eval_short, _, _ = normalize(short_weather[:cut], short_weather[cut:])
+        print('[T3] 短历史站从头拟合', flush=True)
+        scratch, predict_scratch, scratch_loss, _, _ = fit_power(
+            train_short, actual, valid, eval_short, 16, 64, args.device, print, seed=seed, network_factory=NETWORK,
+        )
+        forecasts['scratch_context'] = predict_scratch()
+        receipt['scratch_train_daily_rmse_mw'] = scratch_loss
+        torch.save(scratch.state_dict(), directory / 'scratch.pt')
+        del scratch, predict_scratch, train_short, eval_short
     source_weather, target_weather, mean, scale = normalize(weather(source, regular), short_weather)
     source_power, source_valid = targets(args.data_root, source, regular)
     print(f'[T3] 常规站预训练 {len(source)} 天，随后冻结主干', flush=True)
     encoder, predict_pretrained, source_loss, _, _ = fit_power(
         source_weather, source_power, source_valid, target_weather, 16, 64, args.device, print,
-        seed=A_SEED, network_factory=NETWORK,
+        seed=seed, network_factory=NETWORK,
     )
     transferred, heads = adjust_short(encoder, predict_pretrained, target_weather[:cut], target_weather[cut:],
                                       actual, valid, short, args.device)
     torch.save(encoder.state_dict(), directory / 'frozen_encoder.pt')
-    return dict(zip(MODES, (scratch_prediction, transferred))), {
-        'source_train_daily_rmse_mw': source_loss, 'scratch_train_daily_rmse_mw': scratch_loss,
+    forecasts['frozen_context_ridge'] = transferred
+    return forecasts, {
+        **receipt, 'source_train_daily_rmse_mw': source_loss,
         'source_normalization': {'mean': mean.tolist(), 'scale': scale.tolist()}, 'heads': heads,
     }
 
