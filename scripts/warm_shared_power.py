@@ -295,17 +295,23 @@ def checkpoint_devices(path):
     return sorted(locations)
 
 
+def power_weather(root, train_days, forecast_days, cache_root, workers, progress, dataset_factory=None):
+    roster = load_roster(root)
+    stations = pd.read_csv(root / 'static/power_stations.csv', dtype={'station_id': str}).set_index('station_id')
+    coordinates = stations.loc[roster, ['latitude', 'longitude']].to_numpy(dtype=float)
+    return roster, fetch_features(
+        root, train_days, forecast_days, roster, coordinates, cache_root, workers, progress, dataset_factory,
+    )
+
+
 def fit_forecasts(root, out, train_days, dev_days, workers, epochs, batch, device, *,
                   dataset_factory=None, cache_root=None, seed=SEED, forecast_tag='development'):
     start = monotonic()
     def progress(message):
         print(f'[{monotonic() - start:.1f}s] {message}', flush=True)
 
-    roster = load_roster(root)
-    stations = pd.read_csv(root / 'static/power_stations.csv', dtype={'station_id': str}).set_index('station_id')
-    coordinates = stations.loc[roster, ['latitude', 'longitude']].to_numpy(dtype=float)
-    weather, columns, cache_hits, cache_version = fetch_features(
-        root, train_days, dev_days, roster, coordinates, cache_root or out / 'features', workers, progress, dataset_factory
+    roster, (weather, columns, cache_hits, cache_version) = power_weather(
+        root, train_days, dev_days, cache_root or out / 'features', workers, progress, dataset_factory,
     )
     weather_seconds = monotonic() - start
 
@@ -368,12 +374,12 @@ def main():
     parser.add_argument('--workers', type=int, default=8)
     parser.add_argument('--epochs', type=int, default=16)
     parser.add_argument('--batch-station-days', type=int, default=64)
-    parser.add_argument('--predict-b', action='store_true', help='Fit on train+A and export B forecasts.')
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument('--predict-b', action='store_true', help='Fit on train+A and export B forecasts.')
+    modes.add_argument('--prepare-b-weather', action='store_true', help='Fill the B weather cache in a NetCDF4 environment.')
+    modes.add_argument('--score-only', action='store_true', help='Score frozen predictions in --out without extracting features or training.')
     parser.add_argument('--seed', type=int)
-    parser.add_argument('--score-only', action='store_true', help='Score frozen predictions in --out without extracting features or training.')
     args = parser.parse_args()
-    if args.predict_b and args.score_only:
-        parser.error('--predict-b and --score-only are separate modes.')
     if args.seed is not None and not args.predict_b:
         parser.error('--seed is for B predictions only.')
     if args.score_only:
@@ -393,6 +399,13 @@ def main():
         return
     if not 1 <= args.workers <= 16 or min(args.epochs, args.batch_station_days) < 1:
         parser.error('Use 1 to 16 feature workers and positive epochs and batch size.')
+    if args.prepare_b_weather:
+        from run_companion_warm_t1 import date_roles
+
+        train, forecast = date_roles(args.split, 'B')
+        power_weather(args.data_root, train, forecast, args.cache_root, args.workers,
+                      lambda message: print(f'[T2 B 天气] {message}', flush=True))
+        return
     args.out.mkdir(parents=True, exist_ok=True)
     if (args.out / 'results.json').exists():
         parser.error('Results already exist. Choose a new output directory for a new candidate.')
