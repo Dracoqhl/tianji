@@ -149,7 +149,7 @@ def raw_energy(model, rows, features, mode):
     return values
 
 
-def fit_energy(args, features, training, allowed_days, forecast, mode, directory):
+def fit_energy(args, features, training, allowed_days, forecast, mode, directory, *, seed=A_SEED):
     calibration_days = max(1, len(allowed_days) // 5)
     before_cal = allowed_days[:-calibration_days]
     cal_start = allowed_days[-calibration_days].isoformat()
@@ -161,7 +161,7 @@ def fit_energy(args, features, training, allowed_days, forecast, mode, directory
     if any(frame.empty for frame in (earlier, stop, calibration, pre_cal, training)):
         raise ValueError('A T2 fitting, early stopping or calibration partition is empty.')
     params = {'objective':'regression','n_estimators':500,'num_leaves':15,'min_child_samples':40,
-              'learning_rate':0.04,'random_state':A_SEED,'n_jobs':args.threads}
+              'learning_rate':0.04,'random_state':seed,'n_jobs':args.threads}
     actual = stop['energy'].to_numpy()
     groups = pd.factorize(stop['station_id'])[0]
     counts = np.bincount(groups)
@@ -197,7 +197,7 @@ def fit_energy(args, features, training, allowed_days, forecast, mode, directory
     cap = MAX_PREDICTION['T2']
     directory.mkdir(parents=True, exist_ok=True)
     save_tree_model(final, directory / f'{mode}.joblib')
-    receipt = {'best_iteration': best, 'calibration_start': cal_start, 'inner_stop_start': stop_start,
+    receipt = {'seed': seed, 'best_iteration': best, 'calibration_start': cal_start, 'inner_stop_start': stop_start,
                'fit_rows': len(training), 'calibration_rows': len(calibration),
                'station_factors': factors, 'effective_device': fitted_device(final.booster),
                'fit_and_prediction_seconds': monotonic()-start}
