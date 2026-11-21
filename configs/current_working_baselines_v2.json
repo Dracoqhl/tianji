@@ -1,0 +1,22 @@
+{
+  "scope": "Local experiment baselines",
+  "source_run": "/workspace/qhl/runs/forecast_blends_gpu_v1",
+  "materialized_run": "/workspace/qhl/runs/confirmed_baselines_gpu_v2",
+  "split_sha256": "ac5708425e3ed19d9975732a9d3aac965cc95d6a047d0c49862422b45fbbb837",
+  "T1": {
+    "name": "pooled_tree_two_station_context",
+    "default": "pooled_xgboost",
+    "station_mix": "tree_context_80_20",
+    "stations": ["8M2SF6", "JS32ZB"]
+  },
+  "T2": {
+    "name": "current_t2_tree_integral_90_10",
+    "components": {"mlp_integral": 0.675, "relative_mse": 0.225, "pooled_t1_tree_integral": 0.10}
+  },
+  "T3": {
+    "baseline": "short_only_xgboost",
+    "candidate": "tree_transfer_75_25",
+    "candidate_components": {"short_only_xgboost": 0.75, "frozen_context_ridge": 0.25},
+    "confirmation_report": "T3/score.json"
+  }
+}
