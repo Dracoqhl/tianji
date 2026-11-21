@@ -2,6 +2,10 @@
 
 set -eo pipefail
 set +u
+if [ "$#" -gt 1 ] || { [ "$#" -eq 1 ] && [ "$1" != '--b-only' ]; }; then
+  echo '用法: run_three_track_batch.sh [--b-only]' >&2
+  exit 2
+fi
 cd /workspace/qhl
 python=/workspace/ctt/model_augmentation/final_check/.venv/bin/python
 out=/workspace/qhl/runs/three_track_gpu_batch_v1
@@ -29,20 +33,31 @@ run_stage() {
 }
 
 failed=0
-echo '[1/4] T2 日电量四个窗口'
-run_stage T2 "$script_dir/batch_energy_short.py" T2 --out "$out/T2" --hik-run "$hik" || failed=1
-echo '[2/4] T3 短历史三种训练方式'
-run_stage T3 "$script_dir/batch_energy_short.py" T3 --out "$out/T3" || failed=1
-echo '[3/4] T1 地理与上风近邻逐站筛选'
-t1=("$script_dir/screen_companion_t1_stations.py")
-settings=(--candidate-set spatial --baseline-run "$hik" --out "$out/T1")
-if run_stage T1_screen "${t1[@]}" screen "${settings[@]}"; then
-  echo '[4/4] T1 冻结逐站映射后复核 A 集'
-  run_stage T1_A "${t1[@]}" confirm-a "${settings[@]}" || failed=1
+if [ "${1:-}" = '--b-only' ]; then
+  echo '[B] 复用已完成的 A，自动准入、预测和计分'
 else
-  failed=1
-  printf '%s\tT1_A\tskipped_after_T1_screen\n' "$(date -u +%FT%TZ)" >> "$out/batch_status.tsv"
+  echo '[1/5] T2 日电量四个窗口'
+  if [ ! -s "$out/T2/results.json" ]; then
+    run_stage T2 "$script_dir/batch_energy_short.py" T2 --out "$out/T2" --hik-run "$hik" || failed=1
+  fi
+  echo '[2/5] T3 短历史三种训练方式'
+  if [ ! -s "$out/T3/results.json" ]; then
+    run_stage T3 "$script_dir/batch_energy_short.py" T3 --out "$out/T3" || failed=1
+  fi
+  echo '[3–4/5] T1 逐站筛选与 A 集复核'
+  if [ ! -s "$out/T1/a_station_routes.json" ]; then
+    t1=("$script_dir/screen_companion_t1_stations.py")
+    settings=(--candidate-set spatial --baseline-run "$hik" --out "$out/T1")
+    if run_stage T1_screen "${t1[@]}" screen "${settings[@]}"; then
+      run_stage T1_A "${t1[@]}" confirm-a "${settings[@]}" || failed=1
+    else
+      failed=1
+      printf '%s\tT1_A\tskipped_after_T1_screen\n' "$(date -u +%FT%TZ)" >> "$out/batch_status.tsv"
+    fi
+  fi
+  echo '[5/5] B 自动准入、预测和计分'
 fi
+run_stage B_auto "$script_dir/advance_batch_b.py" --batch "$out" || failed=1
 
 echo "[三赛道结果] $out"
 "$python" -c '
