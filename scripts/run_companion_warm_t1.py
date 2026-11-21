@@ -16,6 +16,7 @@ import pandas as pd
 
 from companion_spatial_features import SPATIAL_COMPONENTS, StationNeighborCache, extend_spatial
 from companion_t1_features import COMPONENTS, LocalWindCache, add_components, station_day_weights
+from companion_power_curve import BINS, CURVE_COLUMN, CURVE_COMPONENTS, RESIDUAL, mean_wind, prepare_curves
 from companion_upwind_terrain import COMPONENT as TERRAIN, UpwindTerrain
 from companion_wind_profile import PROFILE_COMPONENTS, training_shear_thresholds
 from score_forecasts import CAPACITY_MW, MAX_PREDICTION, score_track
@@ -87,7 +88,7 @@ SMOKE_TRAIN_DAYS = 20
 SMOKE_VALIDATION_DAYS = 10
 SMOKE_MAX_ROUNDS = 20
 FORECAST_PARTITIONS = {'full': ((1, 96),), 'halves': ((1, 48), (49, 96))}
-SUPPORTED_COMPONENTS = (*COMPONENTS, *SPATIAL_COMPONENTS, TERRAIN, *PROFILE_COMPONENTS)
+SUPPORTED_COMPONENTS = (*COMPONENTS, *SPATIAL_COMPONENTS, TERRAIN, *PROFILE_COMPONENTS, *CURVE_COMPONENTS)
 
 
 def sha256(path):
@@ -338,11 +339,30 @@ def run(args):
             raise ValueError('The upwind terrain lookup changed during feature extraction.')
     if refit_names != feature_names:
         raise ValueError('Prediction and training feature schemas disagree.')
+    curve_mode = next((mode for mode in CURVE_COMPONENTS if mode in args.components), None)
+    curves = wind_limits = None
+    if curve_mode:
+        print('Cross-fitting the monotone power curve by date inside each tree fit region', flush=True)
+        speed, forecast_speed = mean_wind(inputs, feature_names), mean_wind(predict_inputs, feature_names)
+        train_sites = (positions // 96) % len(roster)
+        curves = prepare_curves(speed, train_sites, target, positions // (96 * len(roster)), inner,
+                                forecast_speed, (prediction_positions // 96) % len(roster), len(roster))
+        feature_names = [*feature_names, CURVE_COLUMN]
+        if args.diagnostic == curve_mode:
+            observed = speed[np.isfinite(speed)]
+            wind_limits = np.quantile(observed, [0.25, 0.75, 0.95]).tolist() if len(observed) else None
+            diagnostic[curve_mode] = np.column_stack((forecast_speed, curves.forecast * CAPACITY_MW))
     shear_thresholds = (training_shear_thresholds(training_diagnostic[args.diagnostic])
                         if args.diagnostic in PROFILE_COMPONENTS else None)
     del training_diagnostic
     valid_sample_hash = hashlib.sha256(positions.tobytes() + target.tobytes()).hexdigest()
     assemble_seconds = monotonic() - start
+
+    def feature_rows(data, prior):
+        return data if prior is None else np.column_stack((data, prior.astype(data.dtype, copy=False)))
+
+    def power_target(power, prior):
+        return power - prior if curve_mode == RESIDUAL else power
 
     def fit(X, y, config, weights, **validation):
         if args.backend == 'lightgbm':
@@ -377,14 +397,20 @@ def run(args):
         fit_start = monotonic()
         print(f'Selecting iterations for points {first}–{last} inside {len(train_days)} training dates, '
               f'seed {args.seed}, {args.backend}/{args.device}, up to {params["n_estimators"]} trees', flush=True)
-        selection, selection_params = fit(inputs[fit_mask], target[fit_mask], params, selection_weight,
-                                          X_valid=inputs[early_stop_mask], y_valid=target[early_stop_mask])
+        fit_prior = curves.selection[fit_mask] if curves is not None else None
+        stop_prior = curves.selection[early_stop_mask] if curves is not None else None
+        selection, selection_params = fit(feature_rows(inputs[fit_mask], fit_prior),
+                                          power_target(target[fit_mask], fit_prior), params, selection_weight,
+                                          X_valid=feature_rows(inputs[early_stop_mask], stop_prior),
+                                          y_valid=power_target(target[early_stop_mask], stop_prior))
         best = best_iteration(selection, backend=args.backend, fallback=params['n_estimators'])
         if best < 1:
             raise ValueError('The companion trainer returned an invalid iteration budget.')
         del selection
         print(f'Refitting points {first}–{last} on all {len(train_days)} training dates with {best} trees', flush=True)
-        fitted, refit_params = fit(inputs[train_selection], target[train_selection],
+        refit_prior = curves.refit[train_selection] if curves is not None else None
+        fitted, refit_params = fit(feature_rows(inputs[train_selection], refit_prior),
+                                   power_target(target[train_selection], refit_prior),
                                    dict(params, n_estimators=best), refit_weight)
         fit_seconds += monotonic() - fit_start
         model_name = 'companion_T1.joblib' if full else f'companion_T1_points_{first:02d}_{last:02d}.joblib'
@@ -393,10 +419,14 @@ def run(args):
         predict_start = monotonic()
         location = 'training-block holdout' if args.train_block else f'phase {args.phase}'
         print(f'Predicting points {first}–{last} for the {len(forecast_days)} {location} dates', flush=True)
-        X = predict_inputs[prediction_selection]
+        forecast_prior = curves.forecast[prediction_selection] if curves is not None else None
+        X = feature_rows(predict_inputs[prediction_selection], forecast_prior)
         values = (predict(fitted, X) if args.backend == 'lightgbm'
                   else predict_tree(fitted, X, backend=args.backend))
-        prediction[prediction_selection] = np.asarray(values, dtype=float).reshape(-1) * CAPACITY_MW
+        values = np.asarray(values, dtype=float).reshape(-1)
+        if curve_mode == RESIDUAL:
+            values += forecast_prior
+        prediction[prediction_selection] = values * CAPACITY_MW
         prediction_seconds += monotonic() - predict_start
         expert_receipts.append({
             'point_range': [first, last], 'model_file': model_name, 'trees': best,
@@ -421,6 +451,8 @@ def run(args):
         diagnostic_info = {'component': args.diagnostic, 'sha256': sha256(path), 'file': path.name}
         if shear_thresholds is not None:
             diagnostic_info['training_abs_shear_p90'] = shear_thresholds
+        if args.diagnostic in CURVE_COMPONENTS:
+            diagnostic_info['training_wind_p25_p75_p95_mps'] = wind_limits
 
     result = {
         'phase': args.phase, 'seed': args.seed, 'components': args.components, 'smoke': args.smoke,
@@ -453,6 +485,14 @@ def run(args):
                       fit_parameters=expert['fit_parameters'])
     if terrain is not None:
         result[TERRAIN] = {'lookup_sha256': lookup_digest, 'training': terrain_training, 'prediction': terrain_prediction}
+    if curves is not None:
+        station_curves, fallback = curves.frozen
+        path = args.out / 'power_curve_prior.json'
+        write_json(path, {'mode': curve_mode, 'target_scale_mw': CAPACITY_MW, 'bin_midpoints_mps': BINS.tolist(),
+                          'station_ids': roster, 'curves_normalized': station_curves.tolist(),
+                          'no_wind_priors_normalized': fallback.tolist()})
+        result['power_curve'] = {'file': path.name, 'sha256': sha256(path), 'cross_fit_date_folds': 3,
+                                 'tree_target': 'residual' if curve_mode == RESIDUAL else 'power'}
     if args.backend == 'lightgbm':
         result['lightgbm_version'] = backend_version
         if full:
@@ -479,7 +519,7 @@ def main():
     parser.add_argument('--phase', choices=('A', 'B'), default='A')
     parser.add_argument('--seed', type=int)
     parser.add_argument('--components', choices=SUPPORTED_COMPONENTS, nargs='*', default=[])
-    parser.add_argument('--diagnostic', choices=(*COMPONENTS, TERRAIN, *PROFILE_COMPONENTS))
+    parser.add_argument('--diagnostic', choices=(*COMPONENTS, TERRAIN, *PROFILE_COMPONENTS, *CURVE_COMPONENTS))
     parser.add_argument('--terrain-lookup', type=Path)
     parser.add_argument('--local-wind-cache', type=Path, default=Path('/workspace/qhl/runs/companion_t1_local_wind'))
     parser.add_argument('--early-stop-days', type=int)
@@ -518,6 +558,9 @@ def main():
     args.components = [component for component in SUPPORTED_COMPONENTS if component in args.components]
     if sum(name in args.components for name in PROFILE_COMPONENTS) > 1:
         parser.error('Select exactly one wind-profile alternative per fit.')
+    curve_count = sum(name in args.components for name in CURVE_COMPONENTS)
+    if curve_count and (curve_count > 1 or args.point_partition != 'full'):
+        parser.error('Select one power-curve alternative with a full-day tree.')
     if TERRAIN in args.components and args.terrain_lookup is None:
         parser.error('The upwind_terrain component requires --terrain-lookup.')
     if not args.smoke and args.seed not in ((A_SEED,) if args.phase == 'A' else B_SEEDS):
