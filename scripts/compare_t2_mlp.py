@@ -3,7 +3,10 @@
 
 import argparse
 import fcntl
+import json
+import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 from tempfile import mkdtemp
@@ -109,29 +112,99 @@ def run_a(args, days, roster):
     return result
 
 
-def select_mlp_python(args):
-    candidates = [args.mlp_python] if args.mlp_python else [
-        Path(sys.executable),
-        Path('/workspace/qhl/.venv/bin/python'),
-        Path('/workspace/qhl/venv/bin/python'),
-        Path('/workspace/.venv/bin/python'),
-        Path('/workspace/tianji-env-check/.venv/bin/python'),
-        *sorted(Path('/workspace').glob('*/.venv/bin/python')),
-        *sorted(Path('/workspace').glob('*/*/.venv/bin/python')),
-        Path('/usr/local/bin/python3'),
-        Path('/usr/bin/python3'),
-    ]
-    probe = ('import netCDF4, torch, pandas; '
-             f'assert {args.device!r} == "cpu" or torch.cuda.is_available()')
-    for python in dict.fromkeys(candidates):
-        if python.is_file():
-            try:
-                result = subprocess.run([str(python), '-c', probe], capture_output=True, timeout=30)
-            except (OSError, subprocess.TimeoutExpired):
+def candidate_pythons(args):
+    yield from (args.mlp_python, args.mlp_weather_python, sys.executable,
+                shutil.which('python'), shutil.which('python3'))
+    home = Path.home()
+    for prefix in (os.environ.get('VIRTUAL_ENV'), os.environ.get('CONDA_PREFIX'),
+                   '/workspace/qhl/.venv', '/workspace/qhl/venv', '/workspace/tianji-env-check/.venv',
+                   '/opt/conda', '/opt/venv', home / '.venv'):
+        if prefix:
+            yield Path(prefix) / 'bin/python'
+
+    skip = {'data', 'datasets', 'features', 'node_modules', 'site-packages', 'lib', 'lib64', '.git', '.cache',
+            '__pycache__', 'include', 'share', 'pkgs'}
+    roots = (args.mlp_run, Path('/workspace'), Path('/opt'), home / 'miniconda3',
+             home / 'miniforge3', home / '.conda/envs', home / '.local/share/mamba/envs')
+    for root in roots:
+        for folder, subdirs, _ in os.walk(root):
+            path = Path(folder)
+            python = path / 'bin/python'
+            if python.is_file():
+                yield python
+            if len(path.relative_to(root).parts) >= 5:
+                subdirs.clear()
+            else:
+                subdirs[:] = sorted(name for name in subdirs if name not in skip)
+
+
+MLP_PROBE = """
+import json
+import sys
+
+import numpy
+import pandas
+
+report = {}
+if sys.argv[2] == "yes":
+    try:
+        import torch
+        torch.ones(1, device=sys.argv[1]).item()
+        report["torch"] = sys.argv[1]
+    except Exception as error:
+        report["torch_error"] = f"{type(error).__name__}: {str(error).splitlines()[0]}"
+if sys.argv[3] == "yes":
+    try:
+        import netCDF4
+        report["weather"] = "netCDF4"
+    except Exception as error:
+        report["weather_error"] = f"{type(error).__name__}: {str(error).splitlines()[0]}"
+print(json.dumps(report))
+"""
+
+
+def select_mlp_runtime(args):
+    torch_python, weather_python = None, None
+    seen = set()
+    for candidate in candidate_pythons(args):
+        if not candidate:
+            continue
+        python = Path(candidate).absolute()
+        if python in seen or not os.access(python, os.X_OK):
+            continue
+        seen.add(python)
+        want_torch = torch_python is None and (args.mlp_python is None or python == args.mlp_python.absolute())
+        want_weather = (weather_python is None
+                        and (args.mlp_weather_python is None or python == args.mlp_weather_python.absolute()))
+        if not (want_torch or want_weather):
+            continue
+        command = [str(python), '-c', MLP_PROBE, args.device,
+                   'yes' if want_torch else 'no', 'yes' if want_weather else 'no']
+        try:
+            result = subprocess.run(command, capture_output=True, text=True, timeout=25)
+            if result.returncode:
+                details = result.stderr.strip().splitlines()
+                print(f'[T2 环境] {python} {details[-1] if details else f"退出码 {result.returncode}"}', flush=True)
                 continue
-            if result.returncode == 0:
-                return python
-    raise RuntimeError('No MLP Python with PyTorch, netCDF4 and the requested device. Set T2_MLP_PYTHON to the original MLP interpreter.')
+            report = json.loads(result.stdout.strip().splitlines()[-1])
+        except (OSError, subprocess.TimeoutExpired, ValueError, IndexError) as error:
+            print(f'[T2 环境] {python} {type(error).__name__}', flush=True)
+            continue
+        if want_torch and report.get('torch'):
+            torch_python = python
+        if want_weather and report.get('weather'):
+            weather_python = python
+        detail = [report.get('torch') or report.get('torch_error'),
+                  report.get('weather') or report.get('weather_error')]
+        print(f'[T2 环境] {python} {" | ".join(item for item in detail if item)}', flush=True)
+        if torch_python and weather_python:
+            return torch_python, weather_python
+    missing = []
+    if torch_python is None:
+        missing.append(f'支持 {args.device} 的 PyTorch')
+    if weather_python is None:
+        missing.append('NetCDF4')
+    raise RuntimeError(f'当前服务器未找到 {"、".join(missing)} 环境。探测详情见 run.log。')
 
 
 def mlp_forecast(args, keys, seed, directory, interpreter):
@@ -188,8 +261,12 @@ def existing_relative_b(args, train, days, keys, runtime):
 
 def build_b_fit(args, train, days, roster, gate):
     keys = keys_for(days, roster, 'T2')
-    interpreter = select_mlp_python(args)
-    print(f'[T2 B] PyTorch 环境 {interpreter}', flush=True)
+    interpreter, weather_python = select_mlp_runtime(args)
+    print(f'[T2 B] PyTorch 环境 {interpreter}，天气读取环境 {weather_python}', flush=True)
+    if interpreter != weather_python:
+        subprocess.run([str(weather_python), '-u', str(WORKER), '--prepare-b-weather',
+                        '--data-root', str(args.data_root), '--split', str(args.split), '--out', str(args.out),
+                        '--cache-root', str(args.mlp_cache), '--workers', str(args.mlp_workers)], check=True)
     component = BLENDS.get(gate['candidate'], gate['candidate'])
     reuse_relative = t2 = t1_recipe = None
     if component == 'relative_mse':
@@ -248,7 +325,8 @@ def execute(args):
                     'blend_trees_fraction': 0.25, 'mlp_workers': args.mlp_workers,
                     'code_sha256': {**code_version(), **{name: sha256(script_dir / name) for name in extra_code}}}
     print(f'[T2 B] 冻结 {gate["candidate"]}，586 + 42 = 628 天重训，92 天计分', flush=True)
-    manifest = lock_predictions(args, 'T2', gate, args.runtime, b_train, b_days, roster, build_fit=build_b_fit)
+    manifest = lock_predictions(args, 'T2', gate, args.runtime, b_train, b_days, roster,
+                                build_fit=build_b_fit, refresh_unstarted=True)
     keys = keys_for(b_days, roster, 'T2')
     directory = args.out / 'T2'
     predictions = before_scoring(directory, 'T2', keys, manifest)
@@ -280,6 +358,7 @@ def main():
     parser.add_argument('--hik-run', type=Path, default=Path('/workspace/qhl/runs/t1_champion_st_tree_gpu_v1'))
     parser.add_argument('--mlp-cache', type=Path, default=Path('/workspace/qhl/runs/warm_power_feature_cache'))
     parser.add_argument('--mlp-python', type=Path)
+    parser.add_argument('--mlp-weather-python', type=Path)
     parser.add_argument('--mlp-workers', type=int, choices=(1, 2), default=2)
     parser.add_argument('--data-root', type=Path, default=Path('/workspace/qhl/data'))
     parser.add_argument('--companion-code', type=Path, default=Path('/workspace/cpy/code'))
