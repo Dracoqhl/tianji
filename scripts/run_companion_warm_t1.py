@@ -23,19 +23,49 @@ def cache_paths(workdir, days):
     return paths
 
 
-def row_positions(meta, station_indices, n_days):
+def row_positions(meta, station_indices, n_days, *, phase, require_full, feature_rows):
     station_indices = [int(index) for index in station_indices]
     stations = {index: i for i, index in enumerate(station_indices)}
-    days = np.asarray(meta['day_idx'], dtype=np.intp)
-    points = np.asarray(meta['point_idx'], dtype=np.intp)
-    slots = np.fromiter((stations[int(i)] for i in meta['station_idx']), dtype=np.intp, count=len(days))
+    axes = {name: np.asarray(meta[name]) for name in ('day_idx', 'station_idx', 'point_idx')}
+    for name, values in axes.items():
+        if values.shape != (feature_rows,):
+            raise ValueError(f'{phase}: {name} shape {values.shape} does not match {feature_rows} feature rows.')
+        numeric = np.asarray(pd.to_numeric(values, errors='raise'))
+        if not np.isfinite(numeric).all() or not np.equal(numeric, numeric.astype(np.intp)).all():
+            raise ValueError(f'{phase}: {name} must contain finite integer row keys.')
+        axes[name] = numeric.astype(np.intp)
+    days = axes['day_idx']
+    points = axes['point_idx']
+    slots = np.fromiter((stations.get(int(i), -1) for i in axes['station_idx']), dtype=np.intp, count=len(days))
+    if np.any(slots < 0):
+        raise ValueError(f'{phase}: unexpected station indices {np.unique(axes["station_idx"][slots < 0])[:5].tolist()}.')
     if np.any((days < 0) | (days >= n_days)) or np.any((points < 1) | (points > 96)):
-        raise ValueError('Companion feature metadata has out-of-range day or point keys.')
+        raise ValueError(f'{phase}: indexed days={n_days}, observed day_idx range={days.min()}..{days.max()}, '
+                         f'point_idx range={points.min()}..{points.max()}.')
     positions = (days * len(station_indices) + slots) * 96 + points - 1
     expected_count = n_days * len(station_indices) * 96
-    if len(positions) != expected_count or np.unique(positions).size != expected_count:
-        raise ValueError('The companion all-points loader must return a complete, unique station/day/point grid.')
-    return positions, days
+    unique = np.unique(positions)
+    stats = {'rows': feature_rows, 'unique_keys': len(unique), 'full_grid_keys': expected_count,
+             'duplicate_rows': feature_rows - len(unique), 'missing_grid_keys': expected_count - len(unique)}
+    rows_by_day = np.bincount(days, minlength=n_days)
+    stats['rows_per_day_min'] = int(rows_by_day.min())
+    stats['rows_per_day_max'] = int(rows_by_day.max())
+    print(f'{phase} keys: {json.dumps(stats)}', flush=True)
+    if stats['duplicate_rows'] or (require_full and stats['missing_grid_keys']):
+        raise ValueError(f'{phase}: duplicate row keys, or incomplete prediction grid. Key counts printed above.')
+    return positions, days, stats
+
+
+def training_targets(root, dates, roster, positions, phase):
+    truth = labels(root, dates, roster)
+    power = truth['power'].to_numpy(dtype=float)
+    required = np.isfinite(power) & truth['power_limit'].eq(1).to_numpy()
+    valid = required[positions]
+    missing = int(required.sum() - valid.sum())
+    print(f'{phase}: qhl valid labels={int(required.sum())}, available in features={int(valid.sum())}, missing={missing}', flush=True)
+    if missing:
+        raise ValueError(f'{phase}: feature rows omit {missing} valid qhl labels. Check the cache and build_gbdt_rows mask.')
+    return (power[positions[valid]] / CAPACITY_MW).astype(np.float32), valid
 
 
 def run(args):
@@ -55,6 +85,25 @@ def run(args):
         raise ValueError('The companion station roster differs from the qhl submission template.')
     train_paths = cache_paths(args.workdir, train_days)
     dev_paths = cache_paths(args.workdir, dev_days)
+    start = monotonic()
+    # Check the development grid before the large training assembly and before fitting.
+    print(f'Checking prediction keys for {len(dev_paths)} development dates', flush=True)
+    dev_inputs, _, dev_metadata = build_gbdt_rows(dev_paths, stations, CAPACITY_MW,
+                                                include_invalid=True, verbose=True)
+    dev_positions, _, dev_key_stats = row_positions(dev_metadata, stations, len(dev_days),
+                                                    phase='development', require_full=True, feature_rows=len(dev_inputs))
+    del dev_metadata
+    if args.check_only:
+        sample_indices = sorted({0, len(train_days) // 2, len(train_days) - 1})
+        sample_days = [train_days[i] for i in sample_indices]
+        sample_paths = [train_paths[i] for i in sample_indices]
+        check_matrix, _, check_meta = build_gbdt_rows(sample_paths, stations, CAPACITY_MW,
+                                                      include_invalid=True, verbose=False)
+        check_positions, _, _ = row_positions(check_meta, stations, len(sample_paths),
+                                               phase='sampled training', require_full=False, feature_rows=len(check_matrix))
+        training_targets(args.data_root, sample_days, roster, check_positions, 'sampled training')
+        print('Development grid and sampled training coverage passed.', flush=True)
+        return
     cfg = load_config(str(args.config or args.companion_code / 'configs' / 'default.json'))
     spec_path = args.workdir / 'stats' / 'feature_spec_train.json'
     feature_names = gbdt_feature_names(load_feature_spec(args.workdir, 'train'))
@@ -63,16 +112,13 @@ def run(args):
     if args.threads:
         params['n_jobs'] = args.threads
 
-    start = monotonic()
     print(f'Reading training features for {len(train_paths)} selected dates', flush=True)
     weather, _, metadata = build_gbdt_rows(train_paths, stations, CAPACITY_MW, include_invalid=True, verbose=True)
-    positions, day_idx = row_positions(metadata, stations, len(train_days))
-    truth = labels(args.data_root, train_days, roster)
-    target = truth['power'].to_numpy(dtype=float)[positions]
-    valid = np.isfinite(target) & truth['power_limit'].eq(1).to_numpy()[positions]
-    del truth, positions, metadata
+    positions, day_idx, train_key_stats = row_positions(metadata, stations, len(train_days),
+                                                       phase='training', require_full=False, feature_rows=len(weather))
+    target, valid = training_targets(args.data_root, train_days, roster, positions, 'training')
+    del positions, metadata
     inputs = np.ascontiguousarray(weather[valid], dtype=np.float32)
-    target = (target[valid] / CAPACITY_MW).astype(np.float32)
     del weather
     inner = day_idx[valid] >= len(train_days) - args.early_stop_days
     if not inner.any() or inner.all():
@@ -95,9 +141,6 @@ def run(args):
 
     prediction_start = monotonic()
     print(f'Predicting the {len(dev_paths)} frozen development dates', flush=True)
-    dev_inputs, _, dev_metadata = build_gbdt_rows(dev_paths, stations, CAPACITY_MW,
-                                                include_invalid=True, verbose=True)
-    dev_positions, _ = row_positions(dev_metadata, stations, len(dev_days))
     output = np.empty(len(dev_positions), dtype=float)
     prediction = np.asarray(predict(fitted, dev_inputs), dtype=float).reshape(-1) * CAPACITY_MW
     if not np.isfinite(prediction).all() or len(prediction) != len(output):
@@ -114,6 +157,7 @@ def run(args):
         'feature_spec_sha256': spec_hash, 'split_sha256': FROZEN_SPLIT,
         'train_days': len(train_paths), 'development_days': len(dev_paths),
         'early_stopping_days_inside_train': args.early_stop_days, 'train_valid_rows': len(target),
+        'feature_keys': {'training': train_key_stats, 'development': dev_key_stats},
         'early_stopping_valid_rows': int(inner.sum()), 'best_iteration': best,
         'feature_count': len(feature_names), 'prediction_rows': len(keys),
         'clipped_predictions': int(((prediction < 0) | (prediction > MAX_PREDICTION['T1'])).sum()),
@@ -135,12 +179,14 @@ def main():
     parser.add_argument('--split', type=Path, default=Path(__file__).resolve().parents[1] / 'configs/warm_date_split_v1.csv')
     parser.add_argument('--early-stop-days', type=int, default=90)
     parser.add_argument('--threads', type=int, default=12)
+    parser.add_argument('--check-only', action='store_true', help='Check the development grid and three training days, without fitting.')
     args = parser.parse_args()
     if args.threads < 1:
         parser.error('--threads must be positive.')
-    args.out.mkdir(parents=True, exist_ok=True)
-    if (args.out / 'companion_T1_development.csv').exists():
-        parser.error('Frozen companion predictions already exist. Choose a new output directory for a rerun.')
+    if not args.check_only:
+        args.out.mkdir(parents=True, exist_ok=True)
+        if (args.out / 'companion_T1_development.csv').exists():
+            parser.error('Frozen companion predictions already exist. Choose a new output directory for a rerun.')
     run(args)
 
 
