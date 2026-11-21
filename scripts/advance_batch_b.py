@@ -163,7 +163,7 @@ def make_t2(args, train_days, days, roster, gate):
     return fit
 
 
-def lock_predictions(args, track, gate, recipe, train, days, roster, *, build_fit=None):
+def lock_predictions(args, track, gate, recipe, train, days, roster, *, build_fit=None, refresh_unstarted=False):
     directory = args.out / track
     directory.mkdir(parents=True, exist_ok=True)
     plan_path = directory / 'plan.json'
@@ -171,8 +171,18 @@ def lock_predictions(args, track, gate, recipe, train, days, roster, *, build_fi
                 'train_days': len(train), 'prediction_days': len(days),
                 'forecast_cache_version': cache_version(cache_paths(args.workdir, days)),
                 'fit_cache_version': cache_version(cache_paths(args.workdir, train))}
-    if plan_path.exists() and read_json(plan_path) != settings:
-        raise ValueError(f'{track}: the B recipe changed after freezing.')
+    if plan_path.exists():
+        previous = read_json(plan_path)
+        if previous != settings:
+            equivalent = {**previous, 'runtime': {**previous['runtime'], 'code_sha256': recipe.get('code_sha256')}}
+            outputs = [path for path in directory.iterdir()
+                       if path != plan_path and not path.name.startswith('plan.unstarted.')]
+            if not refresh_unstarted or equivalent != settings or outputs:
+                raise ValueError(f'{track}: the B recipe changed after freezing.')
+            archive = directory / f'plan.unstarted.{sha256(plan_path)[:12]}.json'
+            write_json(archive, previous)
+            write_json(plan_path, settings)
+            print(f'[{track} B] 已保留未开训的旧计划 {archive.name}', flush=True)
     if not plan_path.exists():
         write_json(plan_path, settings)
     plan_digest = sha256(plan_path)
