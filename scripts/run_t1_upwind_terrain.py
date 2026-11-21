@@ -6,12 +6,11 @@ import fcntl
 from pathlib import Path
 import subprocess
 import sys
-from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
 
-from advance_batch_b import before_scoring, choose_gate, keys_for, lock_predictions, make_t1, paired_scores
+from advance_batch_b import choose_gate, frozen_station_b
 from companion_upwind_terrain import COMPONENT, coverage
 from compare_t2_mlp import candidate_pythons
 from compare_warm_t1 import PRIMARY_SCORE
@@ -154,35 +153,12 @@ def run_b(args, a):
     roster = load_roster(args.data_root)
     gate = b_gate(a, read_json(args.out / FREEZE), roster)
     gate['a_report_sha256'] = sha256(args.out / A_REPORT)
-    gate_path = args.out / 'b_gate.json'
-    if gate_path.is_file() and read_json(gate_path) != gate:
-        raise ValueError('The A-based B enrollment changed.')
-    if not gate_path.is_file():
-        write_json(gate_path, gate)
-    print(f'[B 准入] {gate["candidate"]} A 差 {gate["a_delta"]:+.6f}，{gate["status"]}', flush=True)
-    if gate['status'] != 'promoted':
-        return
-    train, days = date_roles(args.split, 'B')
-    if (len(train), len(days)) != (628, 92):
-        raise ValueError('Expected the frozen 628/92 B split.')
-    b_args = SimpleNamespace(**{**vars(args), 'out': args.out / 'B'})
-    b_args.out.mkdir(exist_ok=True)
     runtime = {'request_sha256': sha256(Path(__file__)), 'code_sha256': code_version(),
                'terrain_lookup_sha256': sha256(args.terrain_lookup), 'split_sha256': sha256(args.split)}
-    digest = lock_predictions(b_args, 'T1', gate, runtime, train, days, roster, build_fit=make_t1)
-    folder = b_args.out / 'T1'
-    forecasts = before_scoring(folder, 'T1', keys_for(days, roster, 'T1'), digest)
-    path = folder / 'score.json'
-    if path.is_file():
-        result = read_json(path)
-        if result['prediction_lock_sha256'] != digest:
-            raise ValueError('The B score uses a different prediction lock.')
-    else:
-        event(b_args.out, 'B', status='all_predictions_verified')
-        result = paired_scores(b_args, 'T1', gate, days, roster, forecasts, digest)
-        write_json(path, result)
-    print(f'[B] 集成差 {result["ensemble"]["delta"][PRIMARY_SCORE]:+.6f}，'
-          f'按规则采用 {result["acceptance"]["accepted"]}，报告 {path}', flush=True)
+    result = frozen_station_b(args, gate, runtime)
+    if result:
+        print(f'[B] 集成差 {result["ensemble"]["delta"][PRIMARY_SCORE]:+.6f}，'
+              f'按规则采用 {result["acceptance"]["accepted"]}，报告 {args.out / "B/T1/score.json"}', flush=True)
 
 
 def execute(args):
