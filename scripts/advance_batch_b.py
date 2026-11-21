@@ -163,7 +163,7 @@ def make_t2(args, train_days, days, roster, gate):
     return fit
 
 
-def lock_predictions(args, track, gate, recipe, train, days, roster):
+def lock_predictions(args, track, gate, recipe, train, days, roster, *, build_fit=None):
     directory = args.out / track
     directory.mkdir(parents=True, exist_ok=True)
     plan_path = directory / 'plan.json'
@@ -186,7 +186,9 @@ def lock_predictions(args, track, gate, recipe, train, days, roster):
         if not path.is_file():
             print(f'[{track} B {step}/{len(B_SEEDS)}] seed={seed} 开始拟合', flush=True)
             if fit is None:
-                fit = (make_t1 if track == 'T1' else make_t2)(args, train, days, roster, gate)
+                if build_fit is None:
+                    build_fit = make_t1 if track == 'T1' else make_t2
+                fit = build_fit(args, train, days, roster, gate)
             stage.mkdir(parents=True, exist_ok=True)
             predictions, details = fit(seed, stage)
             hashes = {arm: save_csv(stage / f'{arm}.csv', predictions[arm]) for arm in ARMS}
