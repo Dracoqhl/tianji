@@ -10,6 +10,7 @@ from pathlib import Path
 
 from companion_t1_features import COMPONENTS
 from companion_spatial_features import SPATIAL_COMPONENTS
+from companion_upwind_terrain import COMPONENT as TERRAIN
 from compare_warm_t1 import MINIMUM_GAIN, PRIMARY_SCORE, compare_pair, daily_scores
 from experiment_companion_t1 import RECIPE_FIELDS, assert_matched, event, fit_or_reuse, load_run, phase_versions
 from experiment_companion_t1 import read_json, setup
@@ -30,7 +31,7 @@ A_REPORT = 'a_station_routes.json'
 CPU_A_REFERENCE = 85.80038190973126
 STATION_RECIPE_FIELDS = tuple(key for key in RECIPE_FIELDS if key != 'early_stopping_days_inside_train')
 ST_TREE = 'st_tree_halves'
-CANDIDATE_SETS = {'features': COMPONENTS, 'st-tree': (ST_TREE,), 'spatial': SPATIAL_COMPONENTS}
+CANDIDATE_SETS = {'features': COMPONENTS, 'st-tree': (ST_TREE,), 'spatial': SPATIAL_COMPONENTS, 'upwind-terrain': (TERRAIN,)}
 
 
 def fit_options(name):
@@ -57,6 +58,8 @@ def study_setup(args):
     if getattr(args, 'baseline_run', None):
         origin = frozen_pooled_origin(args.baseline_run)
         result['baseline_origin'] = {key: origin[key] for key in ('freeze_sha256', 'a_sha256')}
+    if TERRAIN in result['candidates']:
+        result['terrain_lookup_sha256'] = sha256(args.terrain_lookup)
     return result
 
 
@@ -292,7 +295,7 @@ def confirm_a(args, settings):
     keys = forecast_keys(held_out, roster)
     versions = phase_versions(args, train, held_out)
     directory = args.out / 'a'
-    used = [name for name in settings['candidates'] if name in routes.values()]
+    used = [name for name in settings['candidates'] if name == TERRAIN or name in routes.values()]
     total = 2 + len(used)
     show_progress(args.out, 'A 集复核', 0, total, '开始')
     print('[A] Fit the matched GPU baseline', flush=True)
@@ -305,7 +308,7 @@ def confirm_a(args, settings):
         print(f'[A] Refit for frozen station route {name}', flush=True)
         components, partition = fit_options(name)
         receipt, forecast, _ = fit_or_reuse(args, directory / name, keys, 'A', A_SEED, components, versions,
-                                            point_partition=partition)
+                                            diagnostic=TERRAIN if name == TERRAIN else None, point_partition=partition)
         assert_matched(baseline_receipt, receipt)
         receipts[name], candidates[name] = receipt, forecast
         show_progress(args.out, 'A 集复核', index, total, f'{name} 预测已保存')
@@ -325,6 +328,8 @@ def confirm_a(args, settings):
                   historical_lightgbm_reference=CPU_A_REFERENCE)
     if ST_TREE in used:
         report['point_48_to_49'] = noon_change_error(truth, {'baseline': baseline, 'candidate': composite})
+    if TERRAIN in used:
+        report['full_terrain'] = compare_pair(truth, baseline, candidates[TERRAIN], roster, development=True)
     write_json(report_path, report)
     print(f'[A] {args.backend}/{args.device} 基线 {cohort[PRIMARY_SCORE]:.6f}，'
           f'逐站组合 {report["scores"]["candidate"][PRIMARY_SCORE]:.6f}，'
@@ -344,11 +349,14 @@ def main():
     parser.add_argument('--split', type=Path, default=SPLIT_PATH)
     parser.add_argument('--out', type=Path, default=Path('/workspace/qhl/runs/t1_station_screen_gpu_v1'))
     parser.add_argument('--candidate-set', choices=CANDIDATE_SETS, default='features')
+    parser.add_argument('--terrain-lookup', type=Path)
     parser.add_argument('--baseline-run', type=Path, help='Reuse a verified prior pooled baseline from the same date blocks.')
     parser.add_argument('--local-wind-cache', type=Path, default=Path('/workspace/qhl/runs/companion_t1_local_wind'))
     parser.add_argument('--device', choices=('cpu', 'cuda'), default='cuda')
     parser.add_argument('--threads', type=int, default=4)
     args = parser.parse_args()
+    if args.candidate_set == 'upwind-terrain' and args.terrain_lookup is None:
+        parser.error('The upwind-terrain comparison requires --terrain-lookup.')
     if not 1 <= args.threads <= 4:
         parser.error('Use 1 to 4 CPU threads.')
     args.backend = 'xgboost'
