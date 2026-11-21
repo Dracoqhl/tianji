@@ -15,9 +15,10 @@ import pandas as pd
 
 from companion_t1_features import COMPONENTS
 from compare_warm_t1 import MINIMUM_GAIN, PRIMARY_SCORE, b_statistics, compare_pair, diagnostic_errors
-from run_companion_warm_t1 import A_SEED, B_SEEDS, DEFAULT_THREADS, EARLY_STOP_DAYS, SPLIT_PATH
+from run_companion_warm_t1 import A_SEED, B_SEEDS, DEFAULT_THREADS, EARLY_STOP_DAYS, GPU_THREADS, SPLIT_PATH
 from run_companion_warm_t1 import cache_paths, cache_version, date_roles, forecast_keys, sha256, write_json
 from score_forecasts import MAX_PREDICTION, POINT_KEYS, align_predictions, score_track
+from tree_model import check_backend
 from warm_shared_power import FROZEN_SPLIT, labels, load_roster
 
 
@@ -26,12 +27,14 @@ RUNNER = SCRIPT_DIR / 'run_companion_warm_t1.py'
 REFERENCE_A = 85.80089361353807
 A_FREEZE = 'a_freeze.json'
 B_FREEZE = 'b_predictions_frozen.json'
-MATCH_FIELDS = ('phase', 'data_root', 'feature_workdir', 'feature_spec_sha256', 'split_sha256', 'config_sha256',
-                'companion_source_sha256', 'lightgbm_version', 'threads', 'train_days', 'forecast_days',
+MATCH_FIELDS = ('phase', 'backend', 'device', 'backend_version', 'data_root', 'feature_workdir',
+                'feature_spec_sha256', 'split_sha256', 'config_sha256', 'companion_source_sha256',
+                'threads', 'train_days', 'forecast_days',
                 'early_stopping_days_inside_train', 'early_stopping_start_date', 'early_stopping_valid_rows',
                 'companion_cache_metadata_sha256', 'valid_training_sample_sha256')
-RECIPE_FIELDS = ('data_root', 'feature_spec_sha256', 'split_sha256', 'config_sha256',
-                 'companion_source_sha256', 'lightgbm_version', 'threads', 'early_stopping_days_inside_train')
+RECIPE_FIELDS = ('backend', 'device', 'backend_version', 'data_root', 'feature_spec_sha256',
+                 'split_sha256', 'config_sha256', 'companion_source_sha256', 'threads',
+                 'early_stopping_days_inside_train')
 
 
 def read_json(path):
@@ -46,7 +49,7 @@ def event(out, stage, **fields):
 
 def code_version():
     files = ('experiment_companion_t1.py', RUNNER.name, 'companion_t1_features.py', 'compare_warm_t1.py',
-             'warm_shared_power.py', 'independent_t2.py', 'score_forecasts.py')
+             'warm_shared_power.py', 'independent_t2.py', 'score_forecasts.py', 'tree_model.py')
     return {name: sha256(SCRIPT_DIR / name) for name in files}
 
 
@@ -56,16 +59,18 @@ def setup(args):
         'data_root': str(args.data_root.resolve()), 'workdir': str(args.workdir.resolve()),
         'companion_code': str(args.companion_code.resolve()), 'config_sha256': sha256(config_path),
         'local_wind_cache': str(args.local_wind_cache.resolve()), 'split_sha256': sha256(args.split),
+        'backend': args.backend, 'device': args.device, 'backend_version': check_backend(args.backend, args.device),
         'threads': args.threads, 'early_stop_days': EARLY_STOP_DAYS, 'code_sha256': code_version(),
         'a_seed': A_SEED, 'b_seeds': list(B_SEEDS), 'components': list(COMPONENTS), 'minimum_gain': MINIMUM_GAIN,
     }
 
 
-def load_run(directory, expected_keys, phase, seed, components):
+def load_run(directory, expected_keys, phase, seed, components, *, backend, device):
     receipt_path = directory / 'training_receipt.json'
     receipt = read_json(receipt_path)
     expected_file = 'companion_T1_development.csv' if phase == 'A' else 'companion_T1_sealed.csv'
     expected = {'phase': phase, 'seed': seed, 'components': components, 'split_sha256': FROZEN_SPLIT,
+                'backend': backend, 'device': device, 'smoke': False,
                 'train_days': 586 if phase == 'A' else 628, 'forecast_days': 42 if phase == 'A' else 92,
                 'prediction_file': expected_file, 'prediction_rows': len(expected_keys)}
     if any(receipt.get(key) != value for key, value in expected.items()):
@@ -94,6 +99,7 @@ def fit_or_reuse(args, directory, keys, phase, seed, components, versions, diagn
                    '--companion-code', str(args.companion_code), '--workdir', str(args.workdir),
                    '--data-root', str(args.data_root), '--out', str(staging), '--split', str(args.split),
                    '--local-wind-cache', str(args.local_wind_cache), '--threads', str(args.threads),
+                   '--backend', args.backend, '--device', args.device,
                    '--early-stop-days', str(EARLY_STOP_DAYS)]
         if args.config:
             command.extend(('--config', str(args.config)))
@@ -112,11 +118,12 @@ def fit_or_reuse(args, directory, keys, phase, seed, components, versions, diagn
             if process.wait():
                 raise RuntimeError(f'T1 training failed for {directory.name}. See {staging / "train.log"}.')
         # Only publish a directory that contains a verified receipt and complete forecasts.
-        load_run(staging, keys, phase, seed, components)
+        load_run(staging, keys, phase, seed, components, backend=args.backend, device=args.device)
         staging.rename(directory)
         event(args.out, phase, status='fit_complete', run=str(directory.relative_to(args.out)), seed=seed,
               log=str(directory.relative_to(args.out) / 'train.log'))
-    receipt, forecast, digest = load_run(directory, keys, phase, seed, components)
+    receipt, forecast, digest = load_run(directory, keys, phase, seed, components,
+                                         backend=args.backend, device=args.device)
     if receipt['companion_cache_metadata_sha256'] != versions:
         raise ValueError(f'{directory}: companion cache files changed during or after this run.')
     return receipt, forecast, digest
@@ -180,7 +187,7 @@ def screen_a(args):
     train_days, days, roster, keys = dates_and_keys(args, 'A')
     versions = phase_versions(args, train_days, days)
     directory = args.out / 'a'
-    print('[A] Refit and verify the original companion baseline', flush=True)
+    print(f'[A] Fit and verify the baseline feature configuration using {args.backend}/{args.device}', flush=True)
     baseline_receipt, baseline, baseline_digest = fit_or_reuse(
         args, directory / 'baseline', keys, 'A', A_SEED, [], versions,
     )
@@ -189,7 +196,7 @@ def screen_a(args):
     if (len(baseline) != 48384 or score['scored_stations'] != 12 or score['scored_station_days'] != 399):
         raise ValueError(f'A baseline keys or scoring population differs from the registered cohort: {score}.')
     baseline_report = directory / 'baseline.json'
-    write_json(baseline_report, {'scores': score, 'historical_reference': REFERENCE_A,
+    write_json(baseline_report, {'scores': score, 'historical_lightgbm_reference': REFERENCE_A,
                                 'training_receipt_sha256': baseline_digest, 'training': baseline_receipt})
     reports = {baseline_report.name: sha256(baseline_report)}
     print(f'[A] Refitted baseline {score[PRIMARY_SCORE]:.6f}, 12 stations, 399 scored station-days', flush=True)
@@ -296,7 +303,8 @@ def score_b(args):
         raise ValueError('B prediction freeze must contain exactly the six registered forecasts.')
     receipts, forecasts = {}, {'baseline': {}, 'candidate': {}}
     for seed, arm, components, directory in expected_runs:
-        receipt, forecast, digest = load_run(directory, keys, 'B', seed, components)
+        receipt, forecast, digest = load_run(directory, keys, 'B', seed, components,
+                                             backend=frozen['recipe']['backend'], device=frozen['recipe']['device'])
         record = manifest['forecasts'][str(directory.relative_to(args.out))]
         if record != {'training_receipt_sha256': digest, 'prediction_sha256': receipt['prediction_sha256']}:
             raise ValueError(f'{directory}: training receipt or prediction changed after the B freeze.')
@@ -326,6 +334,7 @@ def score_b(args):
     duplicates = {arm: identical_seed_groups(values) for arm, values in forecasts.items()}
     decision = frozen['candidate_components'] if statistics['accepted'] else frozen['baseline_components']
     report = {'b_prediction_freeze_sha256': sha256(manifest_path), 'seeds': list(B_SEEDS),
+              'backend': frozen['recipe']['backend'], 'device': frozen['recipe']['device'],
               'candidate_components': frozen['candidate_components'], 'adopted_components': decision,
               'per_seed': pairs, 'paired_seed_deltas': deltas, 'three_seed_ensemble': ensemble_scores,
               'acceptance': statistics, 'identical_forecast_seed_groups': duplicates,
@@ -345,12 +354,21 @@ def main():
     parser.add_argument('--workdir', type=Path, default=Path('/workspace/cpy/code/workdir'))
     parser.add_argument('--config', type=Path)
     parser.add_argument('--split', type=Path, default=SPLIT_PATH)
-    parser.add_argument('--out', type=Path, default=Path('/workspace/qhl/runs/companion_t1_incremental_v1'))
+    parser.add_argument('--out', type=Path)
     parser.add_argument('--local-wind-cache', type=Path, default=Path('/workspace/qhl/runs/companion_t1_local_wind'))
-    parser.add_argument('--threads', type=int, default=DEFAULT_THREADS)
+    parser.add_argument('--threads', type=int)
+    parser.add_argument('--backend', choices=('lightgbm', 'xgboost'), default='lightgbm')
+    parser.add_argument('--device', choices=('cpu', 'cuda'), default='cpu')
     args = parser.parse_args()
+    if args.threads is None:
+        args.threads = GPU_THREADS if args.device == 'cuda' else DEFAULT_THREADS
+    if args.out is None:
+        suffix = 'v2' if args.backend == 'lightgbm' else f'{args.backend}_{args.device}'
+        args.out = Path(f'/workspace/qhl/runs/companion_t1_incremental_{suffix}')
     if args.threads < 1:
         parser.error('--threads must be positive.')
+    if args.device == 'cuda' and args.threads > GPU_THREADS:
+        parser.error(f'Use at most {GPU_THREADS} CPU threads with CUDA.')
     args.out.mkdir(parents=True, exist_ok=True)
     stages = {'a': screen_a, 'b-predict': predict_b, 'b-score': score_b}
     with (args.out / '.stage.lock').open('a') as lock:
@@ -358,7 +376,7 @@ def main():
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             parser.error('An experiment command is already using this run directory.')
-        event(args.out, args.stage, status='started')
+        event(args.out, args.stage, status='started', backend=args.backend, device=args.device)
         try:
             stages[args.stage](args)
         except (Exception, KeyboardInterrupt) as error:
