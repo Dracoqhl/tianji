@@ -286,7 +286,7 @@ def fit_short(args, names, matrix, target, short_mask, early_mask, forecast, mod
         'fit_points':int(use.sum()),'target_points':int((use & short_mask).sum()),'early_stop_points':int(stopping.sum())}
 
 
-def short_window(args, name, train_days, days, roster, short_roster, source):
+def fit_short_forecasts(args, directory, train_days, days, roster, short_roster, source, *, modes=SHORT_MODELS):
     stations, spec, names, build_rows, params = source
     train_paths = cache_paths(args.workdir, train_days)
     test_paths = cache_paths(args.workdir, days)
@@ -306,19 +306,25 @@ def short_window(args, name, train_days, days, roster, short_roster, source):
     forecast = full_forecast.reshape(len(days),len(roster),96,len(names))[:,kept].reshape(-1,len(names))
     ordered_short = [roster[i] for i in kept]
     keys = forecast_keys(days, ordered_short)
-    directory = args.out/name
     directory.mkdir(parents=True, exist_ok=True)
     predictions, fit = {}, {}
-    for mode in SHORT_MODELS:
-        print(f'[T3 {name}] {mode}',flush=True)
+    for mode in modes:
+        print(f'[T3 {directory.name}] {mode}',flush=True)
         values, fit[mode] = fit_short(args,names,matrix,target,short_mask,early,forecast,mode,params,directory)
         predictions[mode] = keys.assign(prediction=values)
     hashes = {mode:save_csv(directory/f'{mode}.csv', frame) for mode,frame in predictions.items()}
+    return ordered_short, predictions, {'train_days':len(train_days),'score_days':len(days),'inner_stop_start':start,
+                                        'cache':cache,'predictions_sha256':hashes,'fit':fit,'sample_keys':sample}
+
+
+def short_window(args, name, train_days, days, roster, short_roster, source):
+    ordered_short, predictions, fit = fit_short_forecasts(
+        args, args.out/name, train_days, days, roster, short_roster, source,
+    )
     truth = labels(args.data_root,days,ordered_short)
     reports = {mode: dict(score_track('T3',truth,frame,ordered_short,allow_unscored_stations=True),
                           by_station=station_scores(truth,frame)) for mode,frame in predictions.items()}
-    return {'train_days':len(train_days),'score_days':len(days),'inner_stop_start':start,'cache':cache,
-            'predictions_sha256':hashes,'fit':fit,'scores':reports,'sample_keys':sample}
+    return {**fit,'scores':reports}
 
 
 def short_source(args, expected_roster):
