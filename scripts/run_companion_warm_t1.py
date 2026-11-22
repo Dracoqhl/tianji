@@ -251,7 +251,7 @@ def point_mask(positions, first, last):
     return (points >= first) & (points <= last)
 
 
-def run(args):
+def run(args, *, extra_features=None):
     sys.path.insert(0, str(args.companion_code / 'src'))
     backend_version = check_backend(args.backend, args.device)
     from tianji.config import load_config
@@ -315,6 +315,9 @@ def run(args):
     predict_inputs, feature_names, prediction_spatial = extend_spatial(
         predict_inputs, feature_names, prediction_positions, prediction_paths, spatial_cache, args.components,
     )
+    if extra_features is not None:
+        predict_inputs, feature_names = extra_features(predict_inputs, feature_names, forecast_days, roster,
+                                                      prediction_positions)
     terrain = None
     if TERRAIN in args.components:
         lookup_digest = sha256(args.terrain_lookup)
@@ -343,6 +346,8 @@ def run(args):
     inputs, refit_names, training_spatial = extend_spatial(
         inputs, refit_names, positions, train_paths, spatial_cache, args.components,
     )
+    if extra_features is not None:
+        inputs, refit_names = extra_features(inputs, refit_names, train_days, roster, positions)
     if terrain is not None:
         inputs, refit_names, terrain_training, _ = terrain.append(inputs, refit_names, positions)
         if sha256(args.terrain_lookup) != lookup_digest:
