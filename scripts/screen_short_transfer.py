@@ -48,19 +48,19 @@ def encode(model, weather, device):
     return np.concatenate(embeddings)
 
 
-def ridge_residual(values, weights, embedding, forecast_embedding):
+def ridge_residual(values, weights, embedding, forecast_embedding, *, ridge=RIDGE):
     weights = weights / weights.sum()
     center = weights @ embedding
     scale = np.sqrt(weights @ ((embedding - center)**2)).clip(1e-3)
     matrix = np.column_stack([(embedding - center) / scale, np.ones(len(embedding))])
     forecast = (forecast_embedding - center) / scale
-    penalty = np.eye(matrix.shape[1]) * RIDGE
+    penalty = np.eye(matrix.shape[1]) * ridge
     penalty[-1, -1] = 0
     beta = np.linalg.solve(matrix.T @ (matrix * weights[:, None]) + penalty, matrix.T @ (weights * values))
     return forecast @ beta[:-1] + beta[-1], beta, center, scale
 
 
-def adjust_short(encoder, predict, train, forecast, power, valid, roster, device):
+def adjust_short(encoder, predict, train, forecast, power, valid, roster, device, *, ridge=RIDGE):
     embeddings = encode(encoder, np.concatenate((train, forecast)), device)
     raw = predict()
     final = raw[len(train):].copy()
@@ -76,7 +76,7 @@ def adjust_short(encoder, predict, train, forecast, power, valid, roster, device
             continue
         residual = (power[station_train] - raw[:len(train)][station_train])[mask]
         change, beta, center, scale = ridge_residual(residual, weights[mask], fit_encoded[station_train][mask],
-                                                      forecast_encoded[station_train])
+                                                      forecast_encoded[station_train], ridge=ridge)
         final[station_train] += change
         heads[station] = {'points': int(mask.sum()), 'coefficients': beta.tolist(),
                           'feature_center': center.tolist(), 'feature_scale': scale.tolist()}
