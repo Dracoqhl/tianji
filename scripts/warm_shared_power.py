@@ -194,7 +194,8 @@ def normalize(train, development):
 
 
 def fit_power(train, target, valid, devel, epochs, batch, device_name, progress, *, seed=SEED, network_factory=None,
-              objective='daily_rmse', day_weight=None, wind_target=None, wind_weight=0.10):
+              objective='daily_rmse', day_weight=None, wind_target=None, wind_weight=0.10,
+              checkpoint_epochs=(), record_checkpoint=None):
     import torch
     from torch import nn
 
@@ -233,6 +234,13 @@ def fit_power(train, target, valid, devel, epochs, batch, device_name, progress,
         raise ValueError('Unsupported power objective.')
     weight = None if day_weight is None else torch.as_tensor(day_weight[keep], dtype=torch.float32, device=device)
     progress(f'Model and training arrays on {features.device}, stations-days per batch {batch}, dtype {features.dtype}')
+    def predict():
+        network.eval()
+        with torch.inference_mode():
+            output = [torch.sigmoid(network(torch.as_tensor(part, device=device)).squeeze(-1)).cpu().numpy()
+                      for part in np.array_split(devel, max(1, (len(devel) + batch - 1) // batch))]
+        return np.clip(np.concatenate(output).astype(float) * POWER_CAP, 0, POWER_CAP)
+
     trajectory = []
     for epoch in range(1, epochs + 1):
         permutation = torch.randperm(len(features), device=device)
@@ -264,14 +272,10 @@ def fit_power(train, target, valid, devel, epochs, batch, device_name, progress,
         rmse_mw = float(loss_sum.item() / len(features) * POWER_CAP)
         trajectory.append(rmse_mw)
         progress(f'Epoch {epoch}/{epochs}, train daily RMSE {rmse_mw:.4f} MW')
+        if record_checkpoint is not None and epoch in checkpoint_epochs:
+            record_checkpoint(epoch, predict())
+            network.train()
     train_memory = torch.cuda.max_memory_allocated() if device.type == 'cuda' else None
-
-    def predict():
-        network.eval()
-        with torch.inference_mode():
-            output = [torch.sigmoid(network(torch.as_tensor(part, device=device)).squeeze(-1)).cpu().numpy()
-                      for part in np.array_split(devel, max(1, (len(devel) + batch - 1) // batch))]
-        return np.clip(np.concatenate(output).astype(float) * POWER_CAP, 0, POWER_CAP)
 
     device_label = torch.cuda.get_device_name(device) if device.type == 'cuda' else 'CPU'
     return network, predict, trajectory, device_label, train_memory
@@ -341,7 +345,7 @@ def power_weather(root, train_days, forecast_days, cache_root, workers, progress
 
 def fit_forecasts(root, out, train_days, dev_days, workers, epochs, batch, device, *,
                   dataset_factory=None, cache_root=None, seed=SEED, forecast_tag='development', network_factory=None,
-                  weather_loader=power_weather):
+                  weather_loader=power_weather, checkpoint_epochs=()):
     start = monotonic()
     def progress(message):
         print(f'[{monotonic() - start:.1f}s] {message}', flush=True)
@@ -361,9 +365,17 @@ def fit_forecasts(root, out, train_days, dev_days, workers, epochs, batch, devic
     assembly_seconds = monotonic() - assembly_start
 
     train_start = monotonic()
+    snapshot_days = pd.MultiIndex.from_product([[day.isoformat() for day in dev_days], roster],
+                                               names=['date', 'station_id']).to_frame(index=False)
+
+    def save_checkpoint(epoch, forecasts):
+        snapshot_days.assign(energy=0.25 * forecasts.sum(axis=1)).to_csv(
+            out / f'T2_epoch_{epoch}.csv', index=False)
+
     network, predict, trajectory, device_label, peak = fit_power(
         train, actual, valid_mask, development, epochs, batch, device, progress,
         seed=seed, network_factory=network_factory,
+        checkpoint_epochs=checkpoint_epochs, record_checkpoint=save_checkpoint if checkpoint_epochs else None,
     )
     train_seconds = monotonic() - train_start
 
