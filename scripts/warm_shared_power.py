@@ -194,7 +194,7 @@ def normalize(train, development):
 
 
 def fit_power(train, target, valid, devel, epochs, batch, device_name, progress, *, seed=SEED, network_factory=None,
-              objective='daily_rmse', day_weight=None):
+              objective='daily_rmse', day_weight=None, wind_target=None, wind_weight=0.10):
     import torch
     from torch import nn
 
@@ -210,6 +210,11 @@ def fit_power(train, target, valid, devel, epochs, batch, device_name, progress,
                                 nn.Linear(96, 96), nn.SiLU(), nn.Linear(96, 1))
     else:
         network = network_factory(train.shape[-1])
+    if wind_target is not None:
+        if wind_target.shape != target.shape or not hasattr(network, 'encode') or not hasattr(network, 'output'):
+            raise ValueError('Wind supervision needs point targets and a network with an explicit encoder and head.')
+        with torch.random.fork_rng(devices=[]):
+            network.wind_head = nn.Linear(network.output.in_features, 1)
     network = network.to(device)
     optimizer = torch.optim.AdamW(network.parameters(), lr=0.0015, weight_decay=0.001)
     keep = valid.any(axis=1)
@@ -218,6 +223,12 @@ def fit_power(train, target, valid, devel, epochs, batch, device_name, progress,
     features = torch.as_tensor(train[keep], device=device)
     truth = torch.as_tensor(np.where(valid, target / POWER_CAP, 0)[keep], dtype=torch.float32, device=device)
     mask = torch.as_tensor(valid[keep], device=device)
+    if wind_target is not None:
+        available = np.isfinite(wind_target[keep])
+        if not available.any():
+            raise ValueError('No finite auxiliary wind targets in the training batches.')
+        wind_mask = torch.as_tensor(available, device=device)
+        wind_truth = torch.as_tensor(np.where(available, wind_target[keep], 0), dtype=torch.float32, device=device)
     if objective not in ('daily_rmse', 'daily_mse'):
         raise ValueError('Unsupported power objective.')
     weight = None if day_weight is None else torch.as_tensor(day_weight[keep], dtype=torch.float32, device=device)
@@ -227,16 +238,29 @@ def fit_power(train, target, valid, devel, epochs, batch, device_name, progress,
         permutation = torch.randperm(len(features), device=device)
         loss_sum = torch.zeros((), device=device)
         for ids in permutation.split(batch):
-            prediction = torch.sigmoid(network(features[ids]).squeeze(-1))
+            if wind_target is None:
+                prediction = torch.sigmoid(network(features[ids]).squeeze(-1))
+            else:
+                encoded = network.encode(features[ids])
+                prediction = torch.sigmoid(network.output(encoded).squeeze(-1))
             diff_sq = ((prediction - truth[ids])**2 * mask[ids]).sum(dim=1)
             day_mse = diff_sq / mask[ids].sum(dim=1)
             day_rmse = torch.sqrt(day_mse + 1e-8)
             sample_loss = day_rmse if objective == 'daily_rmse' else day_mse
             loss = sample_loss.mean() if weight is None else (sample_loss * weight[ids]).mean()
+            if wind_target is not None:
+                wind_prediction = network.wind_head(encoded).squeeze(-1)
+                wind_error = nn.functional.smooth_l1_loss(wind_prediction, wind_truth[ids], reduction='none')
+                measured = wind_mask[ids]
+                wind_day = (wind_error * measured).sum(dim=1) / measured.sum(dim=1).clamp_min(1)
+                loss = loss + wind_weight * wind_day.mean()
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             optimizer.step()
-            loss_sum += day_rmse.detach().sum() if objective != 'daily_rmse' or weight is not None else loss.detach() * len(ids)
+            if objective == 'daily_rmse' and weight is None and wind_target is None:
+                loss_sum += loss.detach() * len(ids)
+            else:
+                loss_sum += day_rmse.detach().sum()
         rmse_mw = float(loss_sum.item() / len(features) * POWER_CAP)
         trajectory.append(rmse_mw)
         progress(f'Epoch {epoch}/{epochs}, train daily RMSE {rmse_mw:.4f} MW')
