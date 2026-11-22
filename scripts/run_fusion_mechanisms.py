@@ -269,7 +269,7 @@ def stage(args, track, pending=None, *, study=None):
     sites = roster_for(args.data_root, track) if track != 'T1' else load_roster(args.data_root)
     if track == 'T3':
         *screen, (final_window, fit_b, days_b) = t3_windows()
-        predict, names = partial(t3_predict, args), tuple(T3_SHAPE)
+        predict, names = study if study is not None else (partial(t3_predict, args), tuple(T3_SHAPE))
     else:
         train, days = chronological_dates(args.split, 'A')
         fit_b, days_b = chronological_dates(args.split, 'B')
@@ -346,7 +346,7 @@ def score_final(args, track, root, days_b, sites, keys, pairs, lock):
 
 
 def finish_pending(args, result, pending):
-    shared_fit_failed = any(result[track]['status'] == 'failed' for track in ('T1', 'T2'))
+    shared_fit_failed = any(result[track]['status'] == 'failed' for track in ('T1', 'T2') if track in result)
     for track, finish in pending.items():
         if track in ('T1', 'T2') and shared_fit_failed:
             result[track].update(status='failed', B_status='waiting_for_shared_track')
