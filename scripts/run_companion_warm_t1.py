@@ -251,7 +251,7 @@ def point_mask(positions, first, last):
     return (points >= first) & (points <= last)
 
 
-def run(args, *, extra_features=None):
+def run(args, *, extra_features=None, training_weight=None):
     sys.path.insert(0, str(args.companion_code / 'src'))
     backend_version = check_backend(args.backend, args.device)
     from tianji.config import load_config
@@ -409,6 +409,13 @@ def run(args, *, extra_features=None):
         if 'station_day_weight' in args.components:
             selection_weight = station_day_weights(positions[fit_mask], len(stations))
             refit_weight = station_day_weights(positions[train_selection], len(stations))
+        weight_audit = None
+        if training_weight is not None:
+            selection_weight, selection_audit = training_weight(
+                train_days[:-args.early_stop_days], roster, positions[fit_mask], selection_weight)
+            refit_weight, refit_audit = training_weight(
+                train_days, roster, positions[train_selection], refit_weight)
+            weight_audit = {'selection': selection_audit, 'refit': refit_audit}
         fit_start = monotonic()
         print(f'Selecting iterations for points {first}–{last} inside {len(train_days)} training dates, '
               f'seed {args.seed}, {args.backend}/{args.device}, up to {params["n_estimators"]} trees', flush=True)
@@ -448,6 +455,8 @@ def run(args, *, extra_features=None):
             'train_rows': int(training_mask.sum()), 'early_stop_rows': int(early_stop_mask.sum()),
             'fit_parameters': {'selection': selection_params, 'refit': refit_params},
         })
+        if weight_audit is not None:
+            expert_receipts[-1]['training_weight'] = weight_audit
         del fitted, X
     del inputs
 
