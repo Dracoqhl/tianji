@@ -114,6 +114,15 @@ def date_roles(path, phase):
     return sorted(split['train'] + split['development']), sealed
 
 
+def chronological_dates(path, phase):
+    manifest_days(path)
+    days = sorted(date.fromisoformat(value) for value in pd.read_csv(path, dtype=str)['date'])
+    left, right = {'A': (540, 630), 'B': (630, 720)}[phase]
+    if len(days) != 720:
+        raise ValueError('The chronological comparison requires the registered 720 dates.')
+    return days[:left], days[left:right]
+
+
 def training_block_dates(path, first, last):
     train, _ = date_roles(path, 'A')
     prior = [day for day in train if day < first]
@@ -254,7 +263,8 @@ def run(args):
     if args.train_block:
         train_days, forecast_days = training_block_dates(args.split, *args.train_block)
     else:
-        train_days, forecast_days = date_roles(args.split, args.phase)
+        split_dates = chronological_dates if getattr(args, 'chronological', False) else date_roles
+        train_days, forecast_days = split_dates(args.split, args.phase)
     if args.smoke:
         train_days = train_days[:SMOKE_TRAIN_DAYS]
         forecast_days = forecast_days[:SMOKE_VALIDATION_DAYS]
@@ -497,6 +507,8 @@ def run(args):
         result['lightgbm_version'] = backend_version
         if full:
             result['lightgbm_fit_parameters'] = result['fit_parameters']
+    if getattr(args, 'chronological', False):
+        result['chronological_dates'] = {'training': list(map(str, train_days)), 'forecast': list(map(str, forecast_days))}
     if versions != {'training': cache_version(train_paths), 'prediction': cache_version(prediction_paths)}:
         raise ValueError('Companion cache files changed while training or predicting.')
     write_json(args.out / 'training_receipt.json', result)
@@ -517,6 +529,7 @@ def main():
     parser.add_argument('--out', type=Path)
     parser.add_argument('--split', type=Path, default=SPLIT_PATH)
     parser.add_argument('--phase', choices=('A', 'B'), default='A')
+    parser.add_argument('--chronological', action='store_true', help='Use the registered recent 90-day A or B.')
     parser.add_argument('--seed', type=int)
     parser.add_argument('--components', choices=SUPPORTED_COMPONENTS, nargs='*', default=[])
     parser.add_argument('--diagnostic', choices=(*COMPONENTS, TERRAIN, *PROFILE_COMPONENTS, *CURVE_COMPONENTS))
@@ -532,6 +545,8 @@ def main():
                         help='Predict an all-training-role block, fitting only on earlier training dates.')
     parser.add_argument('--check-only', action='store_true', help='Check the full prediction grid and sampled training keys.')
     args = parser.parse_args()
+    if args.chronological and (args.smoke or args.train_block or args.out is None):
+        parser.error('--chronological requires --out and a regular A or B phase.')
     if args.smoke and (args.phase != 'A' or args.out is None):
         parser.error('Use --phase A and an explicit --out for --smoke.')
     if args.train_block and (args.phase != 'A' or args.smoke or args.out is None):
