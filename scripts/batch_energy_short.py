@@ -260,23 +260,25 @@ def pooled_weights(is_short):
     return weights
 
 
-def fit_short(args, names, matrix, target, short_mask, early_mask, forecast, mode, params, directory):
+def fit_short(args, names, matrix, target, short_mask, early_mask, forecast, mode, params, directory,
+              *, selection_weight=None, refit_weight=None):
     use = short_mask if mode == 'short_only' else np.ones(len(target), dtype=bool)
     selection, stopping = use & ~early_mask, short_mask & early_mask
     if not selection.any() or not stopping.any():
         raise ValueError('T3 train/early stop mask has no usable rows.')
 
-    def fit(mask, config, **validation):
-        weights = pooled_weights(short_mask[mask]) if mode == 'pooled_equal_group' else None
+    def fit(mask, config, weights, **validation):
+        if weights is None and mode == 'pooled_equal_group':
+            weights = pooled_weights(short_mask[mask])
         return train_tree(matrix[mask], target[mask], names, config, categorical_features=['station_idx'],
                           early_stopping_rounds=int(params.get('early_stopping_rounds',100)),
                           sample_weight=weights, backend='xgboost', device=args.device, **validation)
 
     start = monotonic()
-    selected = fit(selection,params,X_valid=matrix[stopping],y_valid=target[stopping])
+    selected = fit(selection, params, selection_weight, X_valid=matrix[stopping], y_valid=target[stopping])
     best = best_iteration(selected,backend='xgboost',fallback=params['n_estimators'])
     del selected
-    final = fit(use,dict(params,n_estimators=best))
+    final = fit(use, dict(params, n_estimators=best), refit_weight)
     power = predict_tree(final,forecast,backend='xgboost').astype(float)*CAPACITY_MW
     if not np.isfinite(power).all():
         raise ValueError('Nonfinite T3 power forecast.')
@@ -287,7 +289,7 @@ def fit_short(args, names, matrix, target, short_mask, early_mask, forecast, mod
 
 
 def fit_short_forecasts(args, directory, train_days, days, roster, short_roster, source, *, modes=SHORT_MODELS,
-                        extra_features=None):
+                        extra_features=None, training_weight=None):
     stations, spec, names, build_rows, params = source
     train_paths = cache_paths(args.workdir, train_days)
     test_paths = cache_paths(args.workdir, days)
@@ -319,7 +321,19 @@ def fit_short_forecasts(args, directory, train_days, days, roster, short_roster,
     predictions, fit = {}, {}
     for mode in modes:
         print(f'[T3 {directory.name}] {mode}',flush=True)
-        values, fit[mode] = fit_short(args,names,matrix,target,short_mask,early,forecast,mode,params,directory)
+        weight_options = {}
+        if training_weight is not None:
+            if mode != 'short_only':
+                raise ValueError('Explicit T3 training weights require the short-only branch.')
+            positions = np.flatnonzero(valid)
+            prefix = [day for day in train_days if day.isoformat() < start]
+            selection_weight, selection_audit = training_weight(prefix, roster, positions[short_mask & ~early], None)
+            refit_weight, refit_audit = training_weight(train_days, roster, positions[short_mask], None)
+            weight_options.update(selection_weight=selection_weight, refit_weight=refit_weight)
+        values, fit[mode] = fit_short(args, names, matrix, target, short_mask, early, forecast, mode, params,
+                                      directory, **weight_options)
+        if weight_options:
+            fit[mode]['training_weight'] = {'selection': selection_audit, 'refit': refit_audit}
         predictions[mode] = keys.assign(prediction=values)
     hashes = {mode:save_csv(directory/f'{mode}.csv', frame) for mode,frame in predictions.items()}
     return ordered_short, predictions, {'train_days':len(train_days),'score_days':len(days),'inner_stop_start':start,
