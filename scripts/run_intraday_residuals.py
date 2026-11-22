@@ -66,7 +66,7 @@ def standardized(matrix, mean, scale):
     return np.clip(np.where(np.isfinite(matrix), (matrix-mean)/scale, 0.), -3, 3)
 
 
-def learn_residuals(history, truth, summary, roster):
+def project_history(history, truth):
     aligned = history.merge(truth[POINT_KEYS + ['power', 'power_limit']], on=POINT_KEYS, how='left',
                             sort=False, validate='one_to_one', indicator=True)
     if not aligned['_merge'].eq('both').all():
@@ -85,7 +85,11 @@ def learn_residuals(history, truth, summary, roster):
     gram = np.einsum('dti,dtj,dt,d->dij', centered, centered, valid, inverse_count)
     rhs = np.einsum('dti,dt,d->di', centered, np.where(valid, residual, 0), inverse_count)
     coefficients = np.linalg.solve(gram + .02 * np.eye(N_BASIS), rhs[..., None])[..., 0]
+    return sites, kept, coefficients
 
+
+def learn_residuals(history, truth, summary, roster):
+    sites, kept, coefficients = project_history(history, truth)
     station = (sites[kept, None] == np.asarray(roster)[None, :]).astype(float)
     counts = station.sum(axis=0)
     weights = 1 / (station @ counts)
