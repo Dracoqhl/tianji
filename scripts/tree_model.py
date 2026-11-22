@@ -142,7 +142,7 @@ def lightgbm_progress(period=LOG_PERIOD):
 def train_tree(X_train, y_train, feature_names, params, *, X_valid=None, y_valid=None,
                categorical_features=(), early_stopping_rounds=100, sample_weight=None,
                backend='lightgbm', device='cpu', evaluation=None, maximize=None, valid_weight=None,
-               log_period=LOG_PERIOD):
+               log_period=LOG_PERIOD, evaluation_history=None):
     """Fit a native tree model. XGBoost validation predictions use the best boosting round."""
     check_backend(backend, device)
     names = tuple(feature_names)
@@ -217,11 +217,14 @@ def train_tree(X_train, y_train, feature_names, params, *, X_valid=None, y_valid
                 print_progress(step, rounds, started, scores)
             return False
 
+    evals = [] if valid is None else [(valid, 'validation')]
+    if valid is not None and evaluation_history is not None:
+        evals.insert(0, (training, 'training'))
     with warnings.catch_warnings():
         if device == 'cuda':
             reject_cuda_fallback()
         booster = xgb.train(
-            config, training, num_boost_round=rounds, evals=[] if valid is None else [(valid, 'validation')],
+            config, training, num_boost_round=rounds, evals=evals, evals_result=evaluation_history,
             early_stopping_rounds=stopping, verbose_eval=False, custom_metric=evaluation, maximize=maximize,
             callbacks=[Progress()],
         )
