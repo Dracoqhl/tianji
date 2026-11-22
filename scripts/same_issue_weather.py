@@ -18,13 +18,21 @@ def feature_spec(workdir):
     return Path(workdir) / 'stats/feature_spec_train.json'
 
 
-def archived_issue_weather(workdir, root, days, roster, progress):
+def archived_issue_weather(workdir, root, days, roster, progress, *, issue_fields=None):
     import json
 
-    fields = json.loads(feature_spec(workdir).read_text())['nwp_names']
+    spec = json.loads(feature_spec(workdir).read_text())
+    fields = spec['nwp_names']
     if not set(NWP_FIELDS).issubset(fields):
         raise ValueError('The companion cache is missing registered neural weather columns.')
     indices = [fields.index(name) for name in NWP_FIELDS]
+    issue_fields = issue_fields or {}
+    extra_names = [name for columns in issue_fields.values() for name in columns]
+    if set(issue_fields) - {'obs', 'sat'} or len(set(extra_names)) != len(extra_names):
+        raise ValueError('Expanded issue inputs must use unique OBS or satellite columns.')
+    extra_indices = {group: [spec[group + '_names'].index(name) for name in columns]
+                     for group, columns in issue_fields.items()}
+    base_width = len(NWP_FIELDS) + len(CONTEXT_FIELDS)
     paths = cache_paths(workdir, days)
     before = cache_version(paths)
     coords = pd.read_csv(root / 'static/power_stations.csv', dtype={'station_id': str}).set_index('station_id')
@@ -33,7 +41,7 @@ def archived_issue_weather(workdir, root, days, roster, progress):
         raise ValueError('Forecast roster is missing valid coordinates.')
     angle = 2 * np.pi * np.arange(96) / 96
     phase = np.column_stack([np.sin(angle), np.cos(angle)])
-    output = np.empty((len(days), len(roster), 96, len(indices) + len(CONTEXT_FIELDS)), dtype=np.float32)
+    output = np.empty((len(days), len(roster), 96, base_width + len(extra_names)), dtype=np.float32)
     for i, path in enumerate(paths):
         with np.load(path, allow_pickle=False) as source:
             stations = source['station_ids'].tolist()
@@ -41,14 +49,25 @@ def archived_issue_weather(workdir, root, days, roster, progress):
             if (len(stations) != len(set(stations)) or source['date_code'].tolist() != [path.stem]
                     or array.shape != (len(stations), 96, len(fields))):
                 raise ValueError(f'{path}: bad weather cache keys or schema.')
-            output[i, ..., :len(indices)] = array[[stations.index(site) for site in roster]][:, :, indices]
+            rows = [stations.index(site) for site in roster]
+            output[i, ..., :len(indices)] = array[rows][:, :, indices]
+            first = base_width
+            for group, columns in extra_indices.items():
+                issue = source[group]
+                if issue.shape != (len(stations), len(spec[group + '_names'])):
+                    raise ValueError(f'{path}: invalid {group} input shape.')
+                values = issue[np.ix_(rows, columns)]
+                if np.isinf(values).any():
+                    raise ValueError(f'{path}: {group} input contains infinity.')
+                output[i, ..., first:first+len(columns)] = values[:, None, :]
+                first += len(columns)
         if i == 0 or (i + 1) % 100 == 0 or i + 1 == len(paths):
             progress(f'天气缓存 {i + 1}/{len(paths)}')
-    output[..., -4:-2] = phase
-    output[..., -2:] = coordinates[:, None]
+    output[..., len(indices):len(indices)+2] = phase
+    output[..., len(indices)+2:base_width] = coordinates[:, None]
     if before != cache_version(paths):
         raise ValueError('Weather cache changed during extraction.')
-    return output.reshape(-1, 96, output.shape[-1]), [*NWP_FIELDS, *CONTEXT_FIELDS], before
+    return output.reshape(-1, 96, output.shape[-1]), [*NWP_FIELDS, *CONTEXT_FIELDS, *extra_names], before
 
 
 def warm_archive_weather(workdir, root, train_days, forecast_days, cache_root, workers,
