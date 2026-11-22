@@ -289,7 +289,9 @@ def fit_short(args, names, matrix, target, short_mask, early_mask, forecast, mod
 
 
 def fit_short_forecasts(args, directory, train_days, days, roster, short_roster, source, *, modes=SHORT_MODELS,
-                        extra_features=None, training_weight=None):
+                        extra_features=None, training_weight=None, fit_expert=None):
+    if fit_expert is not None and (tuple(modes) != ('short_only',) or training_weight is not None):
+        raise ValueError('Alternative T3 experts require the unweighted short-only fit.')
     stations, spec, names, build_rows, params = source
     train_paths = cache_paths(args.workdir, train_days)
     test_paths = cache_paths(args.workdir, days)
@@ -321,6 +323,16 @@ def fit_short_forecasts(args, directory, train_days, days, roster, short_roster,
     predictions, fit = {}, {}
     for mode in modes:
         print(f'[T3 {directory.name}] {mode}',flush=True)
+        if fit_expert is not None:
+            start_fit = monotonic()
+            values, receipt = fit_expert(matrix[short_mask], target[short_mask], early[short_mask], forecast,
+                                         names, params, args.device, directory)
+            rows = int(short_mask.sum())
+            fit[mode] = {'fit_points': rows, 'target_points': rows,
+                         'early_stop_points': int((short_mask & early).sum()),
+                         'fit_seconds': monotonic() - start_fit, **receipt}
+            predictions[mode] = keys.assign(prediction=np.clip(values*CAPACITY_MW, 0, MAX_PREDICTION['T3']))
+            continue
         weight_options = {}
         if training_weight is not None:
             if mode != 'short_only':
