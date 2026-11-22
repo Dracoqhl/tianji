@@ -193,7 +193,8 @@ def normalize(train, development):
     return transform(train), transform(development), means, scales
 
 
-def fit_power(train, target, valid, devel, epochs, batch, device_name, progress, *, seed=SEED, network_factory=None):
+def fit_power(train, target, valid, devel, epochs, batch, device_name, progress, *, seed=SEED, network_factory=None,
+              objective='daily_rmse', day_weight=None):
     import torch
     from torch import nn
 
@@ -217,6 +218,9 @@ def fit_power(train, target, valid, devel, epochs, batch, device_name, progress,
     features = torch.as_tensor(train[keep], device=device)
     truth = torch.as_tensor(np.where(valid, target / POWER_CAP, 0)[keep], dtype=torch.float32, device=device)
     mask = torch.as_tensor(valid[keep], device=device)
+    if objective not in ('daily_rmse', 'daily_mse'):
+        raise ValueError('Unsupported power objective.')
+    weight = None if day_weight is None else torch.as_tensor(day_weight[keep], dtype=torch.float32, device=device)
     progress(f'Model and training arrays on {features.device}, stations-days per batch {batch}, dtype {features.dtype}')
     trajectory = []
     for epoch in range(1, epochs + 1):
@@ -225,11 +229,14 @@ def fit_power(train, target, valid, devel, epochs, batch, device_name, progress,
         for ids in permutation.split(batch):
             prediction = torch.sigmoid(network(features[ids]).squeeze(-1))
             diff_sq = ((prediction - truth[ids])**2 * mask[ids]).sum(dim=1)
-            loss = torch.sqrt(diff_sq / mask[ids].sum(dim=1) + 1e-8).mean()
+            day_mse = diff_sq / mask[ids].sum(dim=1)
+            day_rmse = torch.sqrt(day_mse + 1e-8)
+            sample_loss = day_rmse if objective == 'daily_rmse' else day_mse
+            loss = sample_loss.mean() if weight is None else (sample_loss * weight[ids]).mean()
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             optimizer.step()
-            loss_sum += loss.detach() * len(ids)
+            loss_sum += day_rmse.detach().sum() if objective != 'daily_rmse' or weight is not None else loss.detach() * len(ids)
         rmse_mw = float(loss_sum.item() / len(features) * POWER_CAP)
         trajectory.append(rmse_mw)
         progress(f'Epoch {epoch}/{epochs}, train daily RMSE {rmse_mw:.4f} MW')
