@@ -286,7 +286,8 @@ def fit_short(args, names, matrix, target, short_mask, early_mask, forecast, mod
         'fit_points':int(use.sum()),'target_points':int((use & short_mask).sum()),'early_stop_points':int(stopping.sum())}
 
 
-def fit_short_forecasts(args, directory, train_days, days, roster, short_roster, source, *, modes=SHORT_MODELS):
+def fit_short_forecasts(args, directory, train_days, days, roster, short_roster, source, *, modes=SHORT_MODELS,
+                        extra_features=None):
     stations, spec, names, build_rows, params = source
     train_paths = cache_paths(args.workdir, train_days)
     test_paths = cache_paths(args.workdir, days)
@@ -303,6 +304,14 @@ def fit_short_forecasts(args, directory, train_days, days, roster, short_roster,
     early = history.loc[valid,'date'].ge(start).to_numpy()
     kept = [i for i, station in enumerate(roster) if station in short_roster]
     full_forecast = weather_rows(test_paths, stations, roster, spec, names, context,dtype)
+    if extra_features is not None:
+        matrix, fitted_names = extra_features(matrix, names, train_days, roster, np.flatnonzero(valid))
+        full_forecast, forecast_names = extra_features(
+            full_forecast, names, days, roster, np.arange(len(full_forecast)),
+        )
+        if fitted_names != forecast_names:
+            raise ValueError('T3 augmented train and forecast feature names differ.')
+        names = fitted_names
     forecast = full_forecast.reshape(len(days),len(roster),96,len(names))[:,kept].reshape(-1,len(names))
     ordered_short = [roster[i] for i in kept]
     keys = forecast_keys(days, ordered_short)
