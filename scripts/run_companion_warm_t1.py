@@ -251,7 +251,7 @@ def point_mask(positions, first, last):
     return (points >= first) & (points <= last)
 
 
-def run(args, *, extra_features=None, training_weight=None):
+def run(args, *, extra_features=None, training_weight=None, date_partition=None):
     sys.path.insert(0, str(args.companion_code / 'src'))
     backend_version = check_backend(args.backend, args.device)
     from tianji.config import load_config
@@ -260,7 +260,12 @@ def run(args, *, extra_features=None, training_weight=None):
     if args.backend == 'lightgbm':
         from tianji.models.gbdt import predict, save_model, train_lgbm
 
-    if args.train_block:
+    if date_partition is not None:
+        train_days, forecast_days = map(list, date_partition)
+        if (not train_days or not forecast_days or train_days != sorted(set(train_days))
+                or forecast_days != sorted(set(forecast_days)) or train_days[-1] >= forecast_days[0]):
+            raise ValueError('Explicit training dates must be ordered, unique and earlier than forecast dates.')
+    elif args.train_block:
         train_days, forecast_days = training_block_dates(args.split, *args.train_block)
     else:
         split_dates = chronological_dates if getattr(args, 'chronological', False) else date_roles
@@ -521,7 +526,7 @@ def run(args, *, extra_features=None, training_weight=None):
         result['lightgbm_version'] = backend_version
         if full:
             result['lightgbm_fit_parameters'] = result['fit_parameters']
-    if getattr(args, 'chronological', False):
+    if date_partition is not None or getattr(args, 'chronological', False):
         result['chronological_dates'] = {'training': list(map(str, train_days)), 'forecast': list(map(str, forecast_days))}
     if versions != {'training': cache_version(train_paths), 'prediction': cache_version(prediction_paths)}:
         raise ValueError('Companion cache files changed while training or predicting.')
