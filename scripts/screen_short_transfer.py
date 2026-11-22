@@ -83,11 +83,12 @@ def adjust_short(encoder, predict, train, forecast, power, valid, roster, device
     return np.clip(final, 0, MAX_PREDICTION['T3']), heads
 
 
-def fit_models(args, source, regular, short, train, days, directory, *, seed=A_SEED, include_scratch=True):
+def fit_models(args, source, regular, short, train, days, directory, *, seed=A_SEED, include_scratch=True,
+               weather_reader=archived_issue_weather):
     import torch
 
     def weather(dates, sites):
-        return archived_issue_weather(args.workdir, args.data_root, dates, sites, print)[0]
+        return weather_reader(args.workdir, args.data_root, dates, sites, print)[0]
 
     short_weather = weather([*train, *days], short)
     cut = len(train) * len(short)
