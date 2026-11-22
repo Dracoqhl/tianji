@@ -263,7 +263,7 @@ def score_window(args, track, days, sites, arms):
                                  by_station=station_scores(truth, frame)) for name, frame in arms.items()}}
 
 
-def stage(args, track, pending=None):
+def stage(args, track, pending=None, *, study=None):
     root = args.out / track
     root.mkdir(parents=True, exist_ok=True)
     sites = roster_for(args.data_root, track) if track != 'T1' else load_roster(args.data_root)
@@ -276,8 +276,11 @@ def stage(args, track, pending=None):
         if fit_b != train + days:
             raise ValueError('B fit must include all A dates.')
         screen, final_window = [('A', train, days)], 'B'
-        predict, names = (partial(t1_predict, args), T1_ARMS) if track == 'T1' else (
-            partial(t2_predict, args), T2_ARMS)
+        if study is not None:
+            predict, names = study
+        else:
+            predict, names = (partial(t1_predict, args), T1_ARMS) if track == 'T1' else (
+                partial(t2_predict, args), T2_ARMS)
 
     initial, screen_locks = {}, {}
     for i, (window, train, days) in enumerate(screen):
@@ -299,7 +302,7 @@ def stage(args, track, pending=None):
     if not promoted:
         return result
 
-    extra = {'weather': t1_weather(args, fit_b, days_b, sites)} if track == 'T1' else {}
+    extra = {'weather': t1_weather(args, fit_b, days_b, sites)} if track == 'T1' and study is None else {}
     pairs, locks = {}, {}
     for i, seed in enumerate(B_SEEDS):
         show_progress(root, f'{track} 三种子复核', i, len(B_SEEDS), str(seed))
@@ -342,6 +345,20 @@ def score_final(args, track, root, days_b, sites, keys, pairs, lock):
     return result
 
 
+def finish_pending(args, result, pending):
+    shared_fit_failed = any(result[track]['status'] == 'failed' for track in ('T1', 'T2'))
+    for track, finish in pending.items():
+        if track in ('T1', 'T2') and shared_fit_failed:
+            result[track].update(status='failed', B_status='waiting_for_shared_track')
+            continue
+        try:
+            result[track].update(B=finish(), B_status='scored')
+        except Exception as error:
+            traceback.print_exc()
+            result[track].update(status='failed', B_status='scoring_failed', error=str(error))
+        write_json(args.out / 'summary.json', result)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     defaults = {'out': RUNS / 'fusion_mechanisms_cpu_v1', 'data-root': Path('/workspace/qhl/data'),
@@ -370,17 +387,7 @@ def main():
                 traceback.print_exc()
                 result[track] = {'status': 'failed', 'error': str(error)}
             write_json(args.out / 'summary.json', result)
-        shared_fit_failed = any(result[track]['status'] == 'failed' for track in ('T1', 'T2'))
-        for track, finish in pending.items():
-            if track in ('T1', 'T2') and shared_fit_failed:
-                result[track].update(status='failed', B_status='waiting_for_shared_track')
-                continue
-            try:
-                result[track].update(B=finish(), B_status='scored')
-            except Exception as error:
-                traceback.print_exc()
-                result[track].update(status='failed', B_status='scoring_failed', error=str(error))
-            write_json(args.out / 'summary.json', result)
+        finish_pending(args, result, pending)
         result['seconds'] = round(monotonic() - start, 2)
         write_json(args.out / 'summary.json', result)
         show_progress(args.out, '融合机制', 3, 3, '结果已保存')
