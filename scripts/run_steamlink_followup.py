@@ -129,8 +129,8 @@ def wind_alternatives(args, train, days, roster, selected=None):
     return reference, result, threshold, details
 
 
-def native_forecast(args, phase, seed, keys):
-    directory = args.out / 'T1' / phase / str(seed) / NATIVE
+def native_forecast(args, phase, seed, keys, *, component=NATIVE, feature_append=append_native, columns=NAMES):
+    directory = args.out / 'T1' / phase / str(seed) / component
     directory.parent.mkdir(parents=True, exist_ok=True)
     old = args.power_run / 'T1' / phase / str(seed) / 'tree' / 'training_receipt.json'
     baseline = read_json(old)
@@ -142,14 +142,14 @@ def native_forecast(args, phase, seed, keys):
         options.chronological, options.train_block, options.smoke, options.check_only = True, None, False, False
         options.backend, options.components, options.point_partition = 'xgboost', [], 'full'
         options.early_stop_days, options.diagnostic = EARLY_STOP_DAYS, None
-        run_tree(options, extra_features=partial(append_native, args.data_root, args.out / 'native_weather'))
+        run_tree(options, extra_features=partial(feature_append, args.data_root, args.out / 'native_weather'))
         pending.rename(directory)
     info = read_json(marker)
     matched = ('seed', 'chronological_dates', 'early_stopping_days_inside_train', 'backend', 'device',
                'threads', 'config_sha256', 'companion_cache_metadata_sha256', 'valid_training_sample_sha256',
                'feature_spec_sha256', 'companion_source_sha256')
     assert_matched(baseline, info, matched)
-    if info['feature_names'] != baseline['feature_names'] + NAMES:
+    if info['feature_names'] != baseline['feature_names'] + columns:
         raise ValueError('Wrong native feature schema.')
     return read_frozen_forecast(directory / info['prediction_file'], info['prediction_sha256'], keys, 'T1'), sha256(marker)
 
