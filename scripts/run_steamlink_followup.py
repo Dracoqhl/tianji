@@ -129,7 +129,8 @@ def wind_alternatives(args, train, days, roster, selected=None):
     return reference, result, threshold, details
 
 
-def native_forecast(args, phase, seed, keys, *, component=NATIVE, feature_append=append_native, columns=NAMES):
+def native_forecast(args, phase, seed, keys, *, component=NATIVE, feature_append=append_native,
+                    columns=NAMES, training_weight=None):
     directory = args.out / 'T1' / phase / str(seed) / component
     directory.parent.mkdir(parents=True, exist_ok=True)
     old = args.power_run / 'T1' / phase / str(seed) / 'tree' / 'training_receipt.json'
@@ -142,7 +143,8 @@ def native_forecast(args, phase, seed, keys, *, component=NATIVE, feature_append
         options.chronological, options.train_block, options.smoke, options.check_only = True, None, False, False
         options.backend, options.components, options.point_partition = 'xgboost', [], 'full'
         options.early_stop_days, options.diagnostic = EARLY_STOP_DAYS, None
-        run_tree(options, extra_features=partial(feature_append, args.data_root, args.out / 'native_weather'))
+        run_tree(options, extra_features=partial(feature_append, args.data_root, args.out / 'native_weather'),
+                 training_weight=training_weight)
         pending.rename(directory)
     info = read_json(marker)
     matched = ('seed', 'chronological_dates', 'early_stopping_days_inside_train', 'backend', 'device',
