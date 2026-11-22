@@ -60,15 +60,17 @@ def extract(paths, coordinates):
     return np.concatenate([*blocks, active[..., None], gaps], axis=-1).astype(np.float32)
 
 
-def append_native(root, cache, matrix, names, dates, roster, positions):
+def append_native(root, cache, matrix, names, dates, roster, positions, *,
+                  sources=SOURCES, extractor=extract, columns=NAMES, source_version=b''):
     table = pd.read_csv(root / 'static/power_stations.csv', dtype={'station_id': str}).set_index('station_id')
     coords = table.loc[roster, ['latitude', 'longitude']].to_numpy()
     if not np.isfinite(coords).all():
         raise ValueError('Nonfinite station coordinates.')
-    fingerprint = hashlib.sha256(Path(__file__).read_bytes() + coords.tobytes() + repr(roster).encode()).hexdigest()
+    fingerprint = hashlib.sha256(Path(__file__).read_bytes() + source_version
+                                 + coords.tobytes() + repr(roster).encode()).hexdigest()
     cache = cache / fingerprint
     cache.mkdir(parents=True, exist_ok=True)
-    feature = np.empty((len(positions), len(NAMES)), np.float32)
+    feature = np.empty((len(positions), len(columns)), np.float32)
     stride = 96 * len(roster)
     order = np.argsort(positions)
     sorted_positions = positions[order]
@@ -77,20 +79,20 @@ def append_native(root, cache, matrix, names, dates, roster, positions):
         raise ValueError('Native feature rows must have unique in-range keys.')
     for index, day in enumerate(dates):
         folder = root / 'train' / f'{day:%Y%m%d}_0000' / 'nwp'
-        paths = [(folder / name, hours) for name, hours, _ in SOURCES.values()]
+        paths = [(folder / name, hours) for name, hours, _ in sources.values()]
         stamps = [(p.stat().st_size, p.stat().st_mtime_ns) for p, _ in paths]
         key = hashlib.sha256(repr((str(folder.resolve()), stamps)).encode()).hexdigest()[:24]
         file = cache / f'{day}-{key}.npy'
         if not file.exists():
-            values = extract(paths, coords)
+            values = extractor(paths, coords)
             with NamedTemporaryFile(dir=cache, suffix='.npy', delete=False) as pending:
                 np.save(pending, values, allow_pickle=False)
             Path(pending.name).replace(file)
         values = np.load(file, allow_pickle=False)
-        if values.shape != (len(roster), 96, len(NAMES)) or np.isinf(values).any():
+        if values.shape != (len(roster), 96, len(columns)) or np.isinf(values).any():
             raise ValueError(f'{file}: invalid native weather cache.')
         take = slice(*rows[index:index+2])
-        feature[order[take]] = values.reshape(stride, len(NAMES))[sorted_positions[take] % stride]
+        feature[order[take]] = values.reshape(stride, len(columns))[sorted_positions[take] % stride]
         if index == 0 or (index + 1) % 50 == 0 or index + 1 == len(dates):
             print(f'[T1 原生天气] {index + 1}/{len(dates)}', flush=True)
-    return np.column_stack((matrix, feature)), [*names, *NAMES]
+    return np.column_stack((matrix, feature)), [*names, *columns]
