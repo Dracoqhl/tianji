@@ -251,7 +251,8 @@ def point_mask(positions, first, last):
     return (points >= first) & (points <= last)
 
 
-def run(args, *, extra_features=None, training_weight=None, date_partition=None):
+def run(args, *, extra_features=None, training_weight=None, date_partition=None, tree_capacity=None,
+        track_selection=False):
     sys.path.insert(0, str(args.companion_code / 'src'))
     backend_version = check_backend(args.backend, args.device)
     from tianji.config import load_config
@@ -300,6 +301,11 @@ def run(args, *, extra_features=None, training_weight=None, date_partition=None)
 
     config_path = args.config or args.companion_code / 'configs' / 'default.json'
     params = dict(load_config(str(config_path))['gbdt'])
+    if tree_capacity == 'half_leaves':
+        old_leaves = int(params.get('num_leaves', 31))
+        if old_leaves <= 2 or args.backend != 'xgboost':
+            raise ValueError('Cannot reduce the effective XGBoost leaf limit.')
+        params['num_leaves'] = max(2, old_leaves // 2)
     if args.smoke:
         params['n_estimators'] = min(SMOKE_MAX_ROUNDS, int(params['n_estimators']))
     params.update(random_state=args.seed, n_jobs=args.threads)
@@ -384,7 +390,7 @@ def run(args, *, extra_features=None, training_weight=None, date_partition=None)
     def power_target(power, prior):
         return power - prior if curve_mode == RESIDUAL else power
 
-    def fit(X, y, config, weights, **validation):
+    def fit(X, y, config, weights, *, evaluation_history=None, **validation):
         if args.backend == 'lightgbm':
             return fit_companion(train_lgbm, X, y, feature_names, config,
                                  seed=args.seed, threads=args.threads, weights=weights, **validation)
@@ -393,7 +399,7 @@ def run(args, *, extra_features=None, training_weight=None, date_partition=None)
         model = train_tree(
             X, y, feature_names, config, categorical_features=['station_idx'], sample_weight=weights,
             early_stopping_rounds=int(config.get('early_stopping_rounds', 100)),
-            backend=args.backend, device=args.device, **validation,
+            backend=args.backend, device=args.device, evaluation_history=evaluation_history, **validation,
         )
         return model, dict(xgboost_parameters(config, args.device), effective_device=fitted_device(model.booster))
 
@@ -426,10 +432,12 @@ def run(args, *, extra_features=None, training_weight=None, date_partition=None)
               f'seed {args.seed}, {args.backend}/{args.device}, up to {params["n_estimators"]} trees', flush=True)
         fit_prior = curves.selection[fit_mask] if curves is not None else None
         stop_prior = curves.selection[early_stop_mask] if curves is not None else None
+        evaluation_history = {} if track_selection else None
         selection, selection_params = fit(feature_rows(inputs[fit_mask], fit_prior),
                                           power_target(target[fit_mask], fit_prior), params, selection_weight,
                                           X_valid=feature_rows(inputs[early_stop_mask], stop_prior),
-                                          y_valid=power_target(target[early_stop_mask], stop_prior))
+                                          y_valid=power_target(target[early_stop_mask], stop_prior),
+                                          evaluation_history=evaluation_history)
         best = best_iteration(selection, backend=args.backend, fallback=params['n_estimators'])
         if best < 1:
             raise ValueError('The companion trainer returned an invalid iteration budget.')
@@ -462,6 +470,9 @@ def run(args, *, extra_features=None, training_weight=None, date_partition=None)
         })
         if weight_audit is not None:
             expert_receipts[-1]['training_weight'] = weight_audit
+        if evaluation_history is not None:
+            expert_receipts[-1]['selection_curves'] = evaluation_history
+            expert_receipts[-1]['tree_cap'] = int(params['n_estimators'])
         del fitted, X
     del inputs
 
