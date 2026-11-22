@@ -62,17 +62,17 @@ def t1_forecasts(args, phase, seed, keys, reference):
         'v3_tree': sha256(old_receipt), 'candidate_tree': receipt}
 
 
-def t1_stage(args):
+def t1_stage(args, *, predict_pair=t1_forecasts, title='T1 压层'):
     roster = load_roster(args.data_root)
     root = args.out / 'T1'
     train, days = chronological_dates(args.split, 'A')
-    show_progress(root, 'T1 压层 A', 0, 3, '重建 v3 风速功率分支')
+    show_progress(root, f'{title} A', 0, 3, '重建 v3 风速功率分支')
     ref, _, thresholds, weather = wind_alternatives(args, train, days, roster, selected=ARM)
     keys = forecast_keys(days, roster)
-    show_progress(root, 'T1 压层 A', 1, 3, '构建压层日缓存并拟合全天树')
-    frames, source = t1_forecasts(args, 'A', A_SEED, keys, ref)
+    show_progress(root, f'{title} A', 1, 3, '准备并拟合候选全天树')
+    frames, source = predict_pair(args, 'A', A_SEED, keys, ref)
     frames, lock = freeze_window(root / 'A' / 'forecasts', 'T1', keys, frames, {'source': source, 'wind': weather})
-    show_progress(root, 'T1 压层 A', 2, 3, '计分与爬坡诊断')
+    show_progress(root, f'{title} A', 2, 3, '计分与爬坡诊断')
     truth = labels(args.data_root, days, roster)
     scores = block_comparisons(truth, frames, roster, ('candidate',))
     main = {arm: row[PRIMARY_SCORE] for arm, row in scores['scores'].items()}
@@ -82,7 +82,7 @@ def t1_stage(args):
                    'hour_timing': ramp_timing(truth, frames, thresholds[1])}
     freeze_json(root / 'A' / 'score.json', {'scores': scores, 'gate': gate, 'ramp': diagnostics})
     result = {'A': main, 'gate': gate, 'station_pairs': scores['station_pairs']['candidate'], 'ramp': diagnostics}
-    show_progress(root, 'T1 压层 A', 3, 3, f'基线 {main["baseline"]:.6f}，候选 {main["candidate"]:.6f}，差 {delta:+.6f}')
+    show_progress(root, f'{title} A', 3, 3, f'基线 {main["baseline"]:.6f}，候选 {main["candidate"]:.6f}，差 {delta:+.6f}')
     if not gate['promoted']:
         return result
     b_train, b_days = chronological_dates(args.split, 'B')
@@ -93,14 +93,14 @@ def t1_stage(args):
     pairs, locks = {}, {}
     folder = root / 'B'
     for index, seed in enumerate(B_SEEDS):
-        show_progress(root, 'T1 压层 B', index, len(B_SEEDS), f'seed={seed}')
-        frames, source = t1_forecasts(args, 'B', seed, keys, ref)
+        show_progress(root, f'{title} B', index, len(B_SEEDS), f'seed={seed}')
+        frames, source = predict_pair(args, 'B', seed, keys, ref)
         pairs[seed], locks[str(seed)] = freeze_window(folder / str(seed) / 'pair', 'T1', keys, frames,
             {'source': source, 'wind': weather, 'gate': gate})
     digest = freeze_json(folder / 'predictions_frozen.json', locks)
     report = paired_report(folder, 'T1', labels(args.data_root, b_days, roster), roster, keys, pairs, digest)
     result['B'] = summarize_b(report)
-    show_progress(root, 'T1 压层 B', len(B_SEEDS), len(B_SEEDS), '配对计分完成')
+    show_progress(root, f'{title} B', len(B_SEEDS), len(B_SEEDS), '配对计分完成')
     return result
 
 
@@ -161,15 +161,15 @@ def summarize_b(report):
             'identical_seed_groups': report['identical_seed_groups']}
 
 
-def t3_stage(args):
+def t3_stage(args, *, predict_pair=t3_forecasts, title='T3 压层'):
     root = args.out / 'T3'
     short = roster_for(args.data_root, 'T3')
     all_sites, source = short_source(args, load_roster(args.data_root) + short)
     windows = list(t3_windows())
     result = {'A': {}}
     for index, (window, train, days) in enumerate(windows[:2]):
-        show_progress(root, 'T3 压层早窗', index, 2, window)
-        _, frames, digest = t3_forecasts(args, window, train, days, short, all_sites, source, A_SEED)
+        show_progress(root, f'{title} 早窗', index, 2, window)
+        _, frames, digest = predict_pair(args, window, train, days, short, all_sites, source, A_SEED)
         scores = score_t3(labels(args.data_root, days, short), short, frames)
         freeze_json(root / window / 'score.json', {**scores, 'prediction_lock': digest})
         result['A'][window] = {'scores': {name: row[PRIMARY_SCORE] for name, row in scores['scores'].items()},
@@ -179,20 +179,20 @@ def t3_stage(args):
     gate = {'mean_early_delta': average, 'promoted': average > 1e-8}
     result['gate'] = gate
     freeze_json(root / 'a_score.json', result)
-    show_progress(root, 'T3 压层早窗', 2, 2, f'准入 {gate}')
+    show_progress(root, f'{title} 早窗', 2, 2, f'准入 {gate}')
     if gate['promoted']:
         window, train, days = windows[-1]
         folder = root / window
         pairs, locks = {}, {}
         for index, seed in enumerate(B_SEEDS):
-            show_progress(root, 'T3 压层 50/10', index, len(B_SEEDS), f'seed={seed}')
-            keys, arms, source_lock = t3_forecasts(args, window, train, days, short, all_sites, source, seed)
+            show_progress(root, f'{title} 50/10', index, len(B_SEEDS), f'seed={seed}')
+            keys, arms, source_lock = predict_pair(args, window, train, days, short, all_sites, source, seed)
             pairs[seed], locks[str(seed)] = freeze_window(folder / str(seed) / 'pair', 'T3', keys,
                 {arm: arms[arm] for arm in ('baseline', 'candidate')}, {'gate': gate, 'forecast_lock': source_lock})
         digest = freeze_json(folder / 'predictions_frozen.json', locks)
         report = paired_report(folder, 'T3', labels(args.data_root, days, short), short, keys, pairs, digest)
         result['B'] = summarize_b(report)
-        show_progress(root, 'T3 压层 50/10', len(B_SEEDS), len(B_SEEDS), '配对计分完成')
+        show_progress(root, f'{title} 50/10', len(B_SEEDS), len(B_SEEDS), '配对计分完成')
     return result
 
 
