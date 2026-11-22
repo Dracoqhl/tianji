@@ -9,7 +9,7 @@ import numpy as np
 
 
 OBJECTIVES = {'huber': 'reg:pseudohubererror', 'regression': 'reg:squarederror',
-              'regression_l2': 'reg:squarederror', 'l2': 'reg:squarederror'}
+              'regression_l2': 'reg:squarederror', 'l2': 'reg:squarederror', 'binary': 'binary:logistic'}
 LOG_PERIOD = 25
 
 
@@ -36,7 +36,7 @@ def xgboost_parameters(params, device, *, custom_metric=False):
     config = {
         'tree_method': 'hist', 'device': device, 'grow_policy': 'lossguide',
         'max_bin': 256, 'max_cat_to_onehot': 32, 'max_depth': params.get('max_depth', 0),
-        'objective': OBJECTIVES[objective], 'eval_metric': 'rmse',
+        'objective': OBJECTIVES[objective], 'eval_metric': 'logloss' if objective == 'binary' else 'rmse',
         'eta': params.get('learning_rate', 0.05), 'max_leaves': params.get('num_leaves', 31),
         'min_child_weight': params.get('min_child_samples', params.get('min_data_in_leaf', 20)),
         'subsample': params.get('subsample', 1.0), 'colsample_bytree': params.get('colsample_bytree', 1.0),
