@@ -196,7 +196,7 @@ def t2_predict(args, phase, train, days, sites, seed, names):
     return keys, arms, meta
 
 
-def t3_predict(args, window, train, days, sites, seed, names):
+def t3_components(args, window, train, days, sites, seed):
     keys, tree, _, _, original_lock = confirmed_t3(args, window, train, days, sites, seed)
     root = args.ridge_run / 'T3' / window
     folder = root / str(seed)
@@ -220,13 +220,21 @@ def t3_predict(args, window, train, days, sites, seed, names):
                                read_json(receipt)['hashes'][ridge_name], keys, 'T3')
     if not np.allclose(blend(tree, new, .25, 'T3').prediction, base.prediction, atol=1e-6, rtol=0):
         raise ValueError('T3 components do not reproduce the accepted fusion.')
-    delta = (new.prediction - tree.prediction).to_numpy().reshape(-1, 96)
+    return keys, tree, new, base, {'reference': lock, 'source': original_lock}
+
+
+def t3_shape_blend(tree, ridge, fraction, *, base=None):
+    if base is None:
+        base = blend(tree, ridge, .25, 'T3')
+    delta = (ridge.prediction - tree.prediction).to_numpy().reshape(-1, 96)
     shape = (delta - delta.mean(axis=1, keepdims=True)).ravel()
-    arms = {'baseline': base}
-    for name in names:
-        arms[name] = base.assign(prediction=(base.prediction + (T3_SHAPE[name] - .25) * shape).clip(
-            0, MAX_PREDICTION['T3']))
-    return keys, arms, {'reference': lock, 'source': original_lock}
+    return base.assign(prediction=(base.prediction + (fraction - .25) * shape).clip(0, MAX_PREDICTION['T3']))
+
+
+def t3_predict(args, window, train, days, sites, seed, names):
+    keys, tree, ridge, base, source = t3_components(args, window, train, days, sites, seed)
+    return keys, {'baseline': base, **{name: t3_shape_blend(tree, ridge, T3_SHAPE[name], base=base)
+                                       for name in names}}, source
 
 
 def lead_rmse(truth, arms):
