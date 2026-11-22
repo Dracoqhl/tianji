@@ -86,7 +86,7 @@ def phase_forecasts(base, audit, names):
                 SHIFT_FRACTION * steps[name], 0), 0, MAX_PREDICTION['T1']).ravel()) for name in names}
 
 
-def historical_phase(args, train, sites):
+def historical_reference(args, train, sites):
     historical_train, historical_days = replay_dates(args.split)
     if not set(historical_train + historical_days).issubset(train):
         raise ValueError('T1 phase calibration dates escape the fit partition.')
@@ -100,6 +100,11 @@ def historical_phase(args, train, sites):
             or contract['data_root'] != str(args.data_root.resolve())):
         raise ValueError('T1 phase calibration must use the locked strict warm replay.')
     baseline = read_arm(folder, 'baseline', forecast_keys(historical_days, sites), 'T1')
+    return historical_days, baseline, lock
+
+
+def historical_phase(args, train, sites):
+    historical_days, baseline, lock = historical_reference(args, train, sites)
     fitted = learn_phase(baseline, labels(args.data_root, historical_days, sites), sites)
     stamp = freeze_json(args.out / 'T1/phase_fit.json', {'calibration_source': lock, 'sites': fitted,
                                                         'shift_fraction': SHIFT_FRACTION})
