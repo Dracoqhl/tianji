@@ -252,7 +252,10 @@ def point_mask(positions, first, last):
 
 
 def run(args, *, extra_features=None, training_weight=None, date_partition=None, tree_capacity=None,
-        track_selection=False):
+        track_selection=False, fit_expert=None):
+    if fit_expert is not None and (args.backend != 'xgboost' or args.point_partition != 'full'
+                                   or args.components or training_weight is not None or track_selection):
+        raise ValueError('Alternative T1 experts require an unweighted full XGBoost fit with no base components.')
     sys.path.insert(0, str(args.companion_code / 'src'))
     backend_version = check_backend(args.backend, args.device)
     from tianji.config import load_config
@@ -428,6 +431,13 @@ def run(args, *, extra_features=None, training_weight=None, date_partition=None,
                 train_days, roster, positions[train_selection], refit_weight)
             weight_audit = {'selection': selection_audit, 'refit': refit_audit}
         fit_start = monotonic()
+        if fit_expert is not None:
+            values, receipt = fit_expert(inputs, target, inner, predict_inputs, feature_names, params, args.device, args.out)
+            prediction[:] = values * CAPACITY_MW
+            fit_seconds += monotonic() - fit_start
+            expert_receipts.append({'point_range': [first, last], 'train_rows': len(target),
+                                    'early_stop_rows': int(inner.sum()), **receipt})
+            continue
         print(f'Selecting iterations for points {first}–{last} inside {len(train_days)} training dates, '
               f'seed {args.seed}, {args.backend}/{args.device}, up to {params["n_estimators"]} trees', flush=True)
         fit_prior = curves.selection[fit_mask] if curves is not None else None
