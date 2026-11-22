@@ -149,7 +149,8 @@ def raw_energy(model, rows, features, mode):
     return values
 
 
-def fit_energy(args, features, training, allowed_days, forecast, mode, directory, *, seed=A_SEED):
+def fit_energy(args, features, training, allowed_days, forecast, mode, directory, *, seed=A_SEED,
+               training_weight=None):
     calibration_days = max(1, len(allowed_days) // 5)
     before_cal = allowed_days[:-calibration_days]
     cal_start = allowed_days[-calibration_days].isoformat()
@@ -177,9 +178,12 @@ def fit_energy(args, features, training, allowed_days, forecast, mode, directory
         return np.log(values) if mode == 'log_mse' else values
 
     def fit(rows, config, **validation):
+        weight = fit_weights(rows, mode)
+        if training_weight is not None:
+            weight = training_weight(rows, weight)
         return train_tree(rows[features].to_numpy(dtype=np.float32), target(rows), features, config,
                           categorical_features=['station_idx'], backend='xgboost', device=args.device,
-                          early_stopping_rounds=35, sample_weight=fit_weights(rows, mode), **validation)
+                          early_stopping_rounds=35, sample_weight=weight, **validation)
 
     start = monotonic()
     selection = fit(earlier, params, X_valid=stop[features].to_numpy(dtype=np.float32), y_valid=target(stop),
