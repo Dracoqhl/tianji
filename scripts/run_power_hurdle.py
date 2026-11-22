@@ -77,14 +77,15 @@ def fit_hurdle(inputs, target, inner, forecast, names, params, device, folder):
         'mean_forecast_p_positive': float(probability.mean())}
 
 
-def t1_tree(args, phase, train, days, seed, keys):
+def t1_tree(args, phase, train, days, seed, keys, *, component='hurdle', additions=None):
     root = args.dynamic_run / 'T1' / phase / str(seed) / 'dynamic_gradient'
     old_path = root / 'training_receipt.json'
     old = read_json(old_path)
     direct = read_frozen_forecast(root / old['prediction_file'], old['prediction_sha256'], keys, 'T1')
-    target = args.out / 'T1' / phase / str(seed) / 'hurdle'
+    target = args.out / 'T1' / phase / str(seed) / component
     target.parent.mkdir(parents=True, exist_ok=True)
     marker = target / 'training_receipt.json'
+    stamp = additions.stamp(train + days) if additions is not None else None
     if not marker.is_file():
         folder = Path(mkdtemp(dir=target.parent, prefix='.hurdle-attempt-'))
         options = SimpleNamespace(**vars(args))
@@ -92,36 +93,50 @@ def t1_tree(args, phase, train, days, seed, keys):
         options.backend, options.components, options.point_partition = 'xgboost', [], 'full'
         options.train_block, options.smoke, options.check_only, options.diagnostic = None, False, False, None
         options.early_stop_days = EARLY_STOP_DAYS
-        dynamic = partial(append_dynamic, args.data_root, args.dynamic_run / 'native_weather')
-        run(options, extra_features=dynamic, date_partition=(train, days), fit_expert=fit_hurdle)
+        def features(matrix, names, dates, sites, positions):
+            matrix, names = append_dynamic(args.data_root, args.dynamic_run / 'native_weather',
+                                           matrix, names, dates, sites, positions)
+            return additions(matrix, names, dates, sites, positions) if additions is not None else (matrix, names)
+
+        run(options, extra_features=features, date_partition=(train, days),
+            fit_expert=fit_hurdle if additions is None else None)
+        if additions is not None:
+            if stamp != additions.stamp(train + days):
+                raise ValueError('Additional T1 inputs changed during fitting.')
+            freeze_json(folder / 'inputs.json', stamp)
         folder.rename(target)
     receipt = read_json(marker)
     assert_matched(old, receipt, ('seed', 'data_root', 'chronological_dates', 'companion_cache_metadata_sha256',
                                   'device', 'threads', 'backend_version', 'early_stopping_valid_rows',
-                                  'early_stopping_start_date', 'feature_names', 'config_sha256',
+                                  'early_stopping_start_date', 'config_sha256',
                                   'valid_training_sample_sha256', 'companion_source_sha256'))
-    if not set(DYNAMIC_COLUMNS).issubset(receipt['feature_names']):
-        raise ValueError('T1 two-part tree must retain the accepted dynamic gradient inputs.')
+    extra_names = list(additions.names) if additions is not None else []
+    if (not set(DYNAMIC_COLUMNS).issubset(old['feature_names'])
+            or receipt['feature_names'] != old['feature_names'] + extra_names):
+        raise ValueError('The alternative T1 tree changed the accepted feature schema.')
+    if additions is not None and read_json(target / 'inputs.json') != stamp:
+        raise ValueError('Additional T1 inputs do not match the saved fit.')
     candidate = read_frozen_forecast(target / receipt['prediction_file'], receipt['prediction_sha256'], keys, 'T1')
-    return direct, candidate, {'direct': sha256(old_path), 'two_part': sha256(marker)}
+    receipt_key = 'two_part' if additions is None else component
+    return direct, candidate, {'direct': sha256(old_path), receipt_key: sha256(marker)}
 
 
-def t1_predict(args, phase, train, days, sites, seed, names):
+def t1_predict(args, phase, train, days, sites, seed, names, *, component='hurdle', additions=None, fractions=ARMS):
     keys = forecast_keys(days, sites)
     base, reference = t1_v4_reference(args, phase, keys, seed)
     v3, _ = dynamic_baseline(args, phase, keys, seed)
-    direct, branch, source = t1_tree(args, phase, train, days, seed, keys)
+    direct, branch, source = t1_tree(args, phase, train, days, seed, keys, component=component, additions=additions)
     fit = args.phase_run / 'T1/phase_fit.json'
     sites_fit = read_json(fit)['sites']
     delta = (.8 * (branch.prediction - direct.prediction)).where(keys.station_id.ne(STATION), 0.)
     arms = {'baseline': base}
     for name in names:
-        changed = v3.assign(prediction=(v3.prediction + ARMS[name] * delta).clip(0, MAX_PREDICTION['T1']))
+        changed = v3.assign(prediction=(v3.prediction + fractions[name] * delta).clip(0, MAX_PREDICTION['T1']))
         arms[name] = phase_forecasts(changed, sites_fit, (PHASE_ARMS[1],))[PHASE_ARMS[1]]
     return keys, arms, {'v4': reference, 'trees': source, 'smoothing': sha256(fit)}
 
 
-def t3_study(args):
+def t3_study(args, *, component='hurdle', additions=None, fractions=ARMS):
     features = None
 
     def predict(window, train, days, sites, seed, names):
@@ -142,30 +157,36 @@ def t3_study(args):
                      'weather': archive_stamp(args.workdir, train + days), 'feature_names': schema[2]}
         folder = args.out / 'T3' / window / str(seed)
         folder.mkdir(parents=True, exist_ok=True)
-        saved = folder / 'hurdle'
+        if additions is not None:
+            signature.update(extra_inputs=additions.stamp(train + days),
+                             feature_names=[*schema[2], *additions.names])
+        saved = folder / component
         marker = saved / 'fit.json'
         if not marker.is_file():
             pending = Path(mkdtemp(dir=folder, prefix='.hurdle-attempt-'))
             _, _, fitted = fit_short_forecasts(args, pending, train, days, roster, sites,
                                                 (*schema, dict(params, random_state=seed)),
-                                                modes=('short_only',), fit_expert=fit_hurdle)
+                                                modes=('short_only',), extra_features=additions,
+                                                fit_expert=fit_hurdle if additions is None else None)
             assert_matched(old, fitted, ('train_days', 'score_days', 'inner_stop_start', 'sample_keys', 'cache'))
             assert_matched(old['fit']['short_only'], fitted['fit']['short_only'],
                            ('fit_points', 'target_points', 'early_stop_points'))
+            if additions is not None and signature['extra_inputs'] != additions.stamp(train + days):
+                raise ValueError('Additional T3 inputs changed during fitting.')
             freeze_json(pending / 'fit.json', {'signature': signature, 'result': fitted})
             pending.rename(saved)
         record = read_json(marker)
         if record['signature'] != signature:
-            raise ValueError('Existing two-part T3 model uses a different fit contract.')
-        two_part = read_frozen_forecast(saved / 'short_only.csv', record['result']['predictions_sha256']['short_only'],
-                                        keys, 'T3')
+            raise ValueError('Existing alternative T3 model uses a different fit contract.')
+        alternative = read_frozen_forecast(saved / 'short_only.csv', record['result']['predictions_sha256']['short_only'],
+                                           keys, 'T3')
         arms = {'baseline': base}
         for name in names:
-            changed = blend(direct, two_part, ARMS[name], 'T3')
+            changed = blend(direct, alternative, fractions[name], 'T3')
             arms[name] = t3_shape_blend(changed, ridge, T3_SHAPE[SHAPE])
         return keys, arms, {'v3': reference, 'tree': sha256(marker)}
 
-    return predict, tuple(ARMS)
+    return predict, tuple(fractions)
 
 
 def group_errors(truth, frames):
