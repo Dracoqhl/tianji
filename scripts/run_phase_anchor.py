@@ -131,7 +131,7 @@ def taper_fraction(energy):
     return np.clip((energy - lower) / (upper - lower), 0, 1)
 
 
-def t2_predict(args, phase, _train, days, sites, seed, _names):
+def t2_v3_reference(args, phase, days, sites, seed):
     keys = keys_for(days, sites, 'T2')
     calibrated, v2, _ = original_t2(args, phase, seed, days, sites)
     root = args.fusion_run / 'T2'
@@ -160,10 +160,15 @@ def t2_predict(args, phase, _train, days, sites, seed, _names):
     if lock != expected or meta['base_lock'] != v2:
         raise ValueError('T2 v2 and v3 are not linked to the same paired inputs.')
     base = read_arm(folder, name, keys, 'T2')
+    return keys, calibrated, base, {'v3': lock, 'v2': v2, 'anchor': meta.get('t1_lock')}
+
+
+def t2_predict(args, phase, _train, days, sites, seed, _names):
+    keys, calibrated, base, source = t2_v3_reference(args, phase, days, sites, seed)
     fraction = taper_fraction(calibrated.energy)
     candidate = base.assign(energy=calibrated.energy + fraction * (base.energy - calibrated.energy))
     return keys, {'baseline': base, T2_ARM: candidate}, {
-        'v3': lock, 'v2': v2, 'band_mwh': list(ENERGY_BAND),
+        'v3': source['v3'], 'v2': source['v2'], 'band_mwh': list(ENERGY_BAND),
         'tapered_station_days': int((fraction < 1).sum()), 'zero_anchor_station_days': int((fraction == 0).sum())}
 
 
