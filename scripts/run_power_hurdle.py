@@ -34,6 +34,8 @@ from warm_shared_power import labels, load_roster
 
 RUNS = Path('/workspace/qhl/runs')
 ARMS = {'hurdle_half': .5, 'hurdle_full': 1.}
+# This release differs from the original entry only in plan registration.
+LEGACY_PLAN_ENTRY_SHA256 = 'ae520bc69faf0da5c413b5b527640a144868a74cb908f74af7df0f4b2a779eec'
 
 
 def fit_hurdle(inputs, target, inner, forecast, names, params, device, folder):
@@ -214,6 +216,33 @@ def diagnostics(args, track, score):
     return values
 
 
+def register_plan(args):
+    entry = Path(__file__)
+    code_files = ('run_power_hurdle.py', 'run_companion_warm_t1.py', 'batch_energy_short.py',
+                  'tree_model.py', 'run_fusion_mechanisms.py', 'run_intraday_residuals.py')
+    expected = {'args': {name: str(value) for name, value in vars(args).items() if name != 'split'},
+                'split': sha256(args.split), 'arms': ARMS, 'seeds': list(B_SEEDS),
+                'code': {name: sha256(entry.with_name(name)) for name in code_files}}
+    path = args.out / 'plan.json'
+    if not path.is_file():
+        return freeze_json(path, expected)
+
+    recorded = read_json(path)
+    # The split checksum is already registered. Ignore the archive's temporary path.
+    previous_args = recorded['args'].copy()
+    had_split_location = previous_args.pop('split', None) is not None
+    previous_code = recorded['code'].copy()
+    if had_split_location and previous_code.get(entry.name) == LEGACY_PLAN_ENTRY_SHA256:
+        previous_code[entry.name] = expected['code'][entry.name]
+    comparable = {**recorded, 'args': previous_args, 'code': previous_code}
+    if comparable != expected:
+        changed = sorted(key for key in comparable.keys() | expected.keys()
+                         if comparable.get(key) != expected.get(key))
+        raise ValueError(f'{path}: registered inputs changed ({", ".join(changed)}).')
+    print('[Resume] Registered plan verified by split checksum and model inputs.', flush=True)
+    return sha256(path)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     defaults = {'out': RUNS / 'power_hurdle_gpu_v1', 'data-root': Path('/workspace/qhl/data'), 'split': SPLIT_PATH,
@@ -231,11 +260,7 @@ def main():
     args.out.mkdir(parents=True, exist_ok=True)
     with (args.out / '.run.lock').open('a') as file:
         fcntl.flock(file, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        freeze_json(args.out / 'plan.json', {'args': {name: str(value) for name, value in vars(args).items()},
-                    'split': sha256(args.split), 'arms': ARMS, 'seeds': list(B_SEEDS),
-                    'code': {name: sha256(Path(__file__).with_name(name)) for name in
-                             ('run_power_hurdle.py', 'run_companion_warm_t1.py', 'batch_energy_short.py',
-                              'tree_model.py', 'run_fusion_mechanisms.py', 'run_intraday_residuals.py')}})
+        register_plan(args)
         start, result, pending = monotonic(), {}, {}
         studies = {'T1': (partial(t1_predict, args), tuple(ARMS)), 'T3': t3_study(args)}
         for i, (track, study) in enumerate(studies.items()):
